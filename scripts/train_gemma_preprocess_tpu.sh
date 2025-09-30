@@ -1,0 +1,1 @@
+time python scripts/train_gemma_preprocess.py --jax-platform tpu --max-length 512 --global-batch 192
