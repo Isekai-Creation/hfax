@@ -78,6 +78,11 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help="Run JAX on this platform (default: %(default)s).",
     )
+    parser.add_argument(
+        "--drop-incomplete-batches",
+        action="store_true",
+        help="Drop final partial batches instead of padding them.",
+    )
     return parser.parse_args()
 
 
@@ -200,23 +205,73 @@ def _preprocess_split(
     return samples, stats
 
 
+def _pad_batch(
+    batch: Dict[str, np.ndarray], target_batch_size: int, pad_token_id: int
+) -> Tuple[Dict[str, np.ndarray], int]:
+    current = next(iter(batch.values()))
+    current_size = current.shape[0]
+    if current_size == target_batch_size:
+        return batch, 0
+    if current_size > target_batch_size:
+        raise ValueError(
+            f"Batch size {current_size} exceeds target {target_batch_size}."
+        )
+    pad_amount = target_batch_size - current_size
+
+    def _pad_array(array: np.ndarray, value: int) -> np.ndarray:
+        pad_width = [(0, pad_amount)] + [(0, 0)] * (array.ndim - 1)
+        return np.pad(array, pad_width=pad_width, mode="constant", constant_values=value)
+
+    padded_batch: Dict[str, np.ndarray] = {}
+    for key, array in batch.items():
+        if key == "input":
+            pad_value = pad_token_id
+        elif key == "target":
+            pad_value = -100
+        elif key == "loss_mask":
+            pad_value = 0
+        else:
+            pad_value = 0
+        padded_batch[key] = _pad_array(array, pad_value)
+    return padded_batch, pad_amount
+
+
 def _make_batches(
-    samples: List[Dict[str, np.ndarray]], batch_size: int
-) -> Tuple[List[Dict[str, np.ndarray]], int, int]:
-    steps_per_epoch = len(samples) // batch_size
-    trimmed = steps_per_epoch * batch_size
-    dropped = len(samples) - trimmed
-    samples = samples[:trimmed]
+    samples: List[Dict[str, np.ndarray]],
+    batch_size: int,
+    *,
+    pad_token_id: int,
+    drop_incomplete: bool,
+) -> Tuple[List[Dict[str, np.ndarray]], int, int, int]:
+    total_examples = len(samples)
+    full_batches, remainder = divmod(total_examples, batch_size)
+
+    limit = full_batches * batch_size if drop_incomplete else total_examples
+    trimmed_samples = samples[:limit]
 
     batched: List[Dict[str, np.ndarray]] = []
-    for start in range(0, len(samples), batch_size):
-        chunk = samples[start : start + batch_size]
-        if len(chunk) != batch_size:
-            continue
+    for start in range(0, full_batches * batch_size, batch_size):
+        chunk = trimmed_samples[start : start + batch_size]
         batched.append(
             {key: np.stack([s[key] for s in chunk], axis=0) for key in chunk[0]}
         )
-    return batched, steps_per_epoch, dropped
+
+    dropped = remainder if drop_incomplete else 0
+    padded_examples = 0
+    steps_per_epoch = full_batches
+
+    if not drop_incomplete and remainder:
+        chunk = samples[-remainder:]
+        batch = {key: np.stack([s[key] for s in chunk], axis=0) for key in chunk[0]}
+        batch, pad_amount = _pad_batch(batch, batch_size, pad_token_id)
+        padded_examples += pad_amount
+        batched.append(batch)
+        steps_per_epoch += 1
+
+    if drop_incomplete:
+        steps_per_epoch = full_batches
+
+    return batched, steps_per_epoch, dropped, padded_examples
 
 
 def main() -> None:
@@ -232,6 +287,11 @@ def main() -> None:
     tokenizer = hfax.text.Gemma3Tokenizer()
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
     print("✓ Tokenizer initialized.")
+
+    pad_token_id = processor.tokenizer.pad_token_id
+    if pad_token_id is None:
+        raise ValueError("Tokenizer must define a pad_token_id for padding.")
+    pad_token_id = int(pad_token_id)
 
     print("\n2. Preprocessing dataset with max-length padding...")
     train_samples, train_stats = _preprocess_split(
@@ -255,21 +315,35 @@ def main() -> None:
     )
     print("Global batch size:", args.global_batch)
 
-    train_batches, train_steps_per_epoch, train_dropped = _make_batches(
-        train_samples, args.global_batch
+    train_batches, train_steps_per_epoch, train_dropped, train_padded = _make_batches(
+        train_samples,
+        args.global_batch,
+        pad_token_id=pad_token_id,
+        drop_incomplete=args.drop_incomplete_batches,
     )
     if train_steps_per_epoch == 0:
         raise ValueError("Not enough training samples to form a single batch.")
     if train_dropped:
         print(f"Dropping {train_dropped} training examples to keep full batches.")
+    if train_padded:
+        print(
+            f"Padded {train_padded} training examples to complete the final batch."
+        )
 
-    eval_batches, eval_steps_per_epoch, eval_dropped = _make_batches(
-        eval_samples, args.global_batch
+    eval_batches, eval_steps_per_epoch, eval_dropped, eval_padded = _make_batches(
+        eval_samples,
+        args.global_batch,
+        pad_token_id=pad_token_id,
+        drop_incomplete=args.drop_incomplete_batches,
     )
     if eval_steps_per_epoch == 0:
         raise ValueError("Not enough eval samples to form a single batch.")
     if eval_dropped:
         print(f"Dropping {eval_dropped} eval examples to keep full batches.")
+    if eval_padded:
+        print(
+            f"Padded {eval_padded} eval examples to complete the final batch."
+        )
 
     train_ds = kd.data.py.DataSource(
         data_source=PrecomputedSampleDataSource(train_batches),
@@ -277,7 +351,7 @@ def main() -> None:
         batch_size=None,
         num_epochs=args.train_epochs,
         num_workers=TRAIN_NUM_WORKERS,
-        per_worker_buffer_size=0,
+        batch_drop_remainder=False,
     )
     expected_train_steps = train_steps_per_epoch * args.train_epochs
     available_train_steps = len(train_ds)
@@ -285,6 +359,13 @@ def main() -> None:
         raise ValueError(
             f"Expected {expected_train_steps} training steps, got {available_train_steps}."
         )
+    if available_train_steps <= 0:
+        raise ValueError("Training dataset produced zero batches.")
+    # Kauldron's Trainer interprets num_train_steps as the final step index,
+    # so it will execute `num_train_steps + 1` batches. Subtract one to avoid
+    # requesting more batches than we precomputed.
+    planned_train_steps = available_train_steps
+    final_train_step_index = planned_train_steps - 1
     print(
         "len(train_ds):",
         available_train_steps,
@@ -299,7 +380,6 @@ def main() -> None:
         batch_size=None,
         num_epochs=args.eval_epochs,
         num_workers=EVAL_NUM_WORKERS,
-        per_worker_buffer_size=0,
         batch_drop_remainder=False,
     )
     available_eval_steps = len(eval_ds)
@@ -346,13 +426,13 @@ def main() -> None:
         init_transform=hfax.ckpts.LoadCheckpoint(
             path=hfax.ckpts.CheckpointPath.GEMMA3_4B_IT,
         ),
-        num_train_steps=expected_train_steps,
+        num_train_steps=final_train_step_index,
         train_losses={"loss": loss},
         optimizer=optax.adafactor(learning_rate=1e-3),
     )
     print("✓ Trainer configured.")
 
-    print(f"\n6. Starting training for {expected_train_steps} steps...")
+    print(f"\n6. Starting training for {planned_train_steps} steps...")
     state, aux = trainer.train()
     print("\n✓ Training finished.")
 
