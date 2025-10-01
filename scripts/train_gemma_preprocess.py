@@ -5,15 +5,21 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import io
+import json
 import os
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import jax
 import numpy as np
 import optax
+import requests
 from datasets import load_dataset
+from PIL import Image
 from grain import python as grain
 from transformers import AutoProcessor
 
@@ -82,6 +88,52 @@ def parse_args() -> argparse.Namespace:
         "--drop-incomplete-batches",
         action="store_true",
         help="Drop final partial batches instead of padding them.",
+    )
+    parser.add_argument(
+        "--skip-pre-eval",
+        action="store_true",
+        help="Skip running an evaluation before training.",
+    )
+    parser.add_argument(
+        "--sample-image-url",
+        type=str,
+        default=None,
+        help="Optional image URL for chat sampling before/after training.",
+    )
+    parser.add_argument(
+        "--sample-prompt",
+        type=str,
+        default="What can you say about this image: <start_of_image>",
+        help="Prompt used for chat sampling when an image URL is provided.",
+    )
+    parser.add_argument(
+        "--skip-chat-samples",
+        action="store_true",
+        help="Skip pre/post chat sampling even if a sample image is provided.",
+    )
+    parser.add_argument(
+        "--metrics-jsonl",
+        type=str,
+        default=None,
+        help="Path to append JSONL metric records (defaults to run directory).",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="If set, log summary metrics to this Weights & Biases project.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional Weights & Biases entity (team).",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional Weights & Biases run name.",
     )
     return parser.parse_args()
 
@@ -220,7 +272,9 @@ def _pad_batch(
 
     def _pad_array(array: np.ndarray, value: int) -> np.ndarray:
         pad_width = [(0, pad_amount)] + [(0, 0)] * (array.ndim - 1)
-        return np.pad(array, pad_width=pad_width, mode="constant", constant_values=value)
+        return np.pad(
+            array, pad_width=pad_width, mode="constant", constant_values=value
+        )
 
     padded_batch: Dict[str, np.ndarray] = {}
     for key, array in batch.items():
@@ -274,7 +328,187 @@ def _make_batches(
     return batched, steps_per_epoch, dropped, padded_examples
 
 
+def _maybe_download_image(url: Optional[str]) -> Optional[np.ndarray]:
+    if not url:
+        return None
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    return np.array(image, dtype=np.uint8)
+
+
+def _tree_to_floats(mapping: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    if mapping is None:
+        return {}
+    floats: Dict[str, float] = {}
+    for key, value in mapping.items():
+        try:
+            floats[key] = float(np.array(value))
+        except (TypeError, ValueError):
+            continue
+    return floats
+
+
+def _append_metrics_record(path: Path, record: Dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+@dataclass
+class WandbHandle:
+    run: Any
+
+
+def _maybe_init_wandb(args: argparse.Namespace, run_dir: Path) -> Optional[WandbHandle]:
+    if not args.wandb_project:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "wandb is not installed but --wandb-project was provided."
+        ) from exc
+
+    config = {
+        "global_batch": args.global_batch,
+        "max_length": args.max_length,
+        "train_epochs": args.train_epochs,
+        "eval_epochs": args.eval_epochs,
+        "train_split": args.train_split,
+        "eval_split": args.eval_split,
+        "drop_incomplete_batches": args.drop_incomplete_batches,
+    }
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        dir=str(run_dir),
+        config=config,
+    )
+    return WandbHandle(run=run)
+
+
+def _finish_wandb(handle: Optional[WandbHandle]) -> None:
+    if handle is None:
+        return
+    handle.run.finish()
+
+
+def _log_metrics(
+    *,
+    label: str,
+    aux_output: Any,
+    jsonl_path: Optional[Path],
+    wandb_handle: Optional[WandbHandle],
+    step: int,
+) -> None:
+    loss_values = _tree_to_floats(getattr(aux_output, "loss_values", None))
+    metric_values = _tree_to_floats(getattr(aux_output, "metric_values", None))
+
+    if loss_values:
+        print(f"{label} losses:")
+        for key, value in sorted(loss_values.items()):
+            print(f"  {key}: {value:.6f}")
+    if metric_values:
+        print(f"{label} metrics:")
+        for key, value in sorted(metric_values.items()):
+            print(f"  {key}: {value:.6f}")
+
+    record = {
+        "label": label,
+        "step": step,
+        "losses": loss_values,
+        "metrics": metric_values,
+    }
+    if jsonl_path is not None:
+        _append_metrics_record(jsonl_path, record)
+
+    if wandb_handle is not None and (loss_values or metric_values):
+        wandb_data = {f"{label}/loss/{k}": v for k, v in loss_values.items()}
+        wandb_data.update({f"{label}/metric/{k}": v for k, v in metric_values.items()})
+        wandb_data["step"] = step
+        wandb_handle.run.log(wandb_data)
+
+
+def _run_evaluator(
+    *,
+    trainer: kd.train.Trainer,
+    state: Any,
+    label: str,
+    jsonl_path: Optional[Path],
+    wandb_handle: Optional[WandbHandle],
+) -> None:
+    evaluator = trainer.evals.get("eval")
+    if evaluator is None:
+        print(f"{label}: evaluator not configured, skipping.")
+        return
+    print(f"\nRunning {label} evaluation...")
+    aux_state = evaluator.evaluate(state=state, step=int(state.step))
+    if aux_state is None:
+        print(f"{label}: evaluator returned no metrics.")
+        return
+    aux_output = aux_state.compute(flatten=False)
+    _log_metrics(
+        label=label,
+        aux_output=aux_output,
+        jsonl_path=jsonl_path,
+        wandb_handle=wandb_handle,
+        step=int(state.step),
+    )
+
+
+def _run_chat_sample(
+    *,
+    label: str,
+    model: Any,
+    params: Any,
+    tokenizer: Any,
+    prompt: str,
+    image: Optional[np.ndarray],
+    jsonl_path: Optional[Path],
+    wandb_handle: Optional[WandbHandle],
+    run_dir: Path,
+) -> None:
+    sampler = hfax.text.ChatSampler(
+        model=model,
+        params=params,
+        tokenizer=tokenizer,
+    )
+    kwargs = {}
+    if image is not None:
+        kwargs["images"] = [image]
+    print(f"\nRunning {label} chat sample...")
+    response = sampler.chat(prompt, **kwargs)
+    print(f"Prompt: {prompt}")
+    if image is not None:
+        print("Image input provided.")
+    print(f"Response ({label}): {response}")
+
+    jax.clear_caches()
+    print("Cleared JAX compilation cache.")
+
+    record = {
+        "label": f"{label}_chat",
+        "prompt": prompt,
+        "response": response,
+    }
+    if jsonl_path is not None:
+        _append_metrics_record(jsonl_path, record)
+    if wandb_handle is not None:
+        wandb_handle.run.log(
+            {
+                f"chat/{label}/prompt": prompt,
+                f"chat/{label}/response": response,
+            }
+        )
+
+    chat_path = run_dir / f"{label}_chat.txt"
+    with chat_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"Prompt:\n{prompt}\n\nResponse:\n{response}\n")
+
+
 def main() -> None:
+    start_time = time.time()
     args = parse_args()
 
     os.environ["JAX_PLATFORM_NAME"] = args.jax_platform
@@ -326,9 +560,7 @@ def main() -> None:
     if train_dropped:
         print(f"Dropping {train_dropped} training examples to keep full batches.")
     if train_padded:
-        print(
-            f"Padded {train_padded} training examples to complete the final batch."
-        )
+        print(f"Padded {train_padded} training examples to complete the final batch.")
 
     eval_batches, eval_steps_per_epoch, eval_dropped, eval_padded = _make_batches(
         eval_samples,
@@ -341,9 +573,7 @@ def main() -> None:
     if eval_dropped:
         print(f"Dropping {eval_dropped} eval examples to keep full batches.")
     if eval_padded:
-        print(
-            f"Padded {eval_padded} eval examples to complete the final batch."
-        )
+        print(f"Padded {eval_padded} eval examples to complete the final batch.")
 
     train_ds = kd.data.py.DataSource(
         data_source=PrecomputedSampleDataSource(train_batches),
@@ -396,6 +626,14 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=False)
     print(f"Checkpoint run directory: {run_dir}")
 
+    metrics_jsonl_path = (
+        Path(args.metrics_jsonl) if args.metrics_jsonl else run_dir / "metrics.jsonl"
+    )
+    wandb_handle = _maybe_init_wandb(args, run_dir)
+    sample_image = None
+    if not args.skip_chat_samples:
+        sample_image = _maybe_download_image(args.sample_image_url)
+
     print("\n3. Defining Gemma 3 4B model...")
     model = hfax.nn.Gemma3_4B(
         tokens="batch.input",
@@ -431,21 +669,82 @@ def main() -> None:
         optimizer=optax.adafactor(learning_rate=1e-3),
     )
     print("✓ Trainer configured.")
+    pre_state = None
+    if not args.skip_pre_eval or sample_image is not None:
+        pre_state = trainer.init_state()
+        if not args.skip_pre_eval:
+            _run_evaluator(
+                trainer=trainer,
+                state=pre_state,
+                label="pre_training_eval",
+                jsonl_path=metrics_jsonl_path,
+                wandb_handle=wandb_handle,
+            )
+        if sample_image is not None:
+            _run_chat_sample(
+                label="pre_training",
+                model=model,
+                params=pre_state.params,
+                tokenizer=tokenizer,
+                prompt=args.sample_prompt,
+                image=sample_image,
+                jsonl_path=metrics_jsonl_path,
+                wandb_handle=wandb_handle,
+                run_dir=run_dir,
+            )
 
     print(f"\n6. Starting training for {planned_train_steps} steps...")
     state, aux = trainer.train()
     print("\n✓ Training finished.")
 
-    print("\n7. Running a sample evaluation...")
-    sampler = hfax.text.ChatSampler(
-        model=model,
-        params=state.params,
-        tokenizer=tokenizer,
+    if aux is not None:
+        try:
+            aux_output = aux.compute(flatten=False)
+        except AttributeError:
+            print("Training auxiliaries have no compute method; skipping logging.")
+        else:
+            _log_metrics(
+                label="training",
+                aux_output=aux_output,
+                jsonl_path=metrics_jsonl_path,
+                wandb_handle=wandb_handle,
+                step=int(state.step),
+            )
+
+    print("\n7. Running evaluations and chat sampling...")
+    _run_evaluator(
+        trainer=trainer,
+        state=state,
+        label="post_training_eval",
+        jsonl_path=metrics_jsonl_path,
+        wandb_handle=wandb_handle,
     )
-    prompt = "Hello! My next holidays are in Paris."
-    response = sampler.chat(prompt)
-    print(f"\nPrompt: {prompt}")
-    print(f"Response: {response}")
+
+    if sample_image is not None:
+        _run_chat_sample(
+            label="post_training",
+            model=model,
+            params=state.params,
+            tokenizer=tokenizer,
+            prompt=args.sample_prompt,
+            image=sample_image,
+            jsonl_path=metrics_jsonl_path,
+            wandb_handle=wandb_handle,
+            run_dir=run_dir,
+        )
+
+    elapsed_seconds = time.time() - start_time
+    print(
+        "Total run time: "
+        f"{int(elapsed_seconds // 3600):02d}:{int((elapsed_seconds % 3600) // 60):02d}:{int(elapsed_seconds % 60):02d}"
+    )
+    runtime_record = {"label": "runtime", "elapsed_seconds": elapsed_seconds}
+    if metrics_jsonl_path is not None:
+        _append_metrics_record(metrics_jsonl_path, runtime_record)
+    if wandb_handle is not None:
+        wandb_handle.run.log({"runtime/elapsed_seconds": elapsed_seconds})
+
+    _finish_wandb(wandb_handle)
     print("\n✓ Evaluation complete.")
 
 
