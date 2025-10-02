@@ -41,9 +41,113 @@ TRAIN_NUM_WORKERS = max(1, min(32, CPU_COUNT))
 EVAL_NUM_WORKERS = max(1, min(32, CPU_COUNT))
 CHECKPOINT_ROOT = Path("/dev/shm/kauldron_runs")
 
+# -----------------------------------------------------------------------------
+# TPU memory helpers (subprocess tpu_info + torch_xla fallback)
+# -----------------------------------------------------------------------------
+
+
+def _tpu_info_query_subprocess() -> Optional[Tuple[int, int]]:
+    import subprocess, textwrap, json as _json
+    code = textwrap.dedent(
+        r'''
+import json
+try:
+  from tpu_info import device as tpu_device
+  from tpu_info import metrics as tpu_metrics
+  chip_type, count = tpu_device.get_local_chips()
+  if not chip_type or not count:
+    raise SystemExit(2)
+  device_usage = tpu_metrics.get_chip_usage(chip_type)
+  per_chip = [(int(d.total_memory), int(d.memory_usage)) for d in device_usage]
+  if not per_chip:
+    raise SystemExit(3)
+  free = min(t - u for (t, u) in per_chip)
+  total = min(t for (t, _u) in per_chip)
+  print(json.dumps({'free': free, 'total': total}))
+  raise SystemExit(0)
+except Exception:
+  raise SystemExit(1)
+''')
+    try:
+        proc = subprocess.run(
+            ["python", "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        obj = _json.loads(proc.stdout.strip())
+        free = int(obj.get("free", 0))
+        total = int(obj.get("total", 0))
+        if total > 0:
+            return free, total
+    except Exception:
+        return None
+    return None
+
+
+def _maybe_log_tpu_memory(*, log_memory: bool, xla_spmd: bool) -> None:
+    if not log_memory:
+        return
+    try:
+        if jax.default_backend() != "tpu":
+            print("TPU memory logging requested but backend is not TPU.")
+            return
+    except Exception:
+        return
+
+    free = total = used = 0
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore
+        device = xm.xla_device()
+        mem_info = xm.get_memory_info(device)
+        total = int(mem_info.get("bytes_limit", 0))
+        used = int(mem_info.get("bytes_used", 0))
+        free = max(0, total - used)
+    except Exception:
+        res = _tpu_info_query_subprocess()
+        if res is not None:
+            free, total = res
+            used = max(0, total - free)
+        else:
+            print("Failed to query TPU memory via torch_xla or tpu-info.")
+            return
+
+    if total:
+        if xla_spmd:
+            print(
+                f"TPU memory (per-replica): used={used/1e9:.2f} GB, free={free/1e9:.2f} GB, total={total/1e9:.2f} GB"
+            )
+        else:
+            print(
+                f"TPU memory usage: {used/1e9:.2f} / {total/1e9:.2f} GB (used/total)"
+            )
+
+
+def _log_tpu_memory_event(*, enabled: bool, label: str, xla_spmd: bool) -> None:
+    if not enabled:
+        return
+    print(f"[mem] {label}:")
+    _maybe_log_tpu_memory(log_memory=True, xla_spmd=xla_spmd)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--log-tpu-memory",
+        action="store_true",
+        help="Print TPU memory usage at key phases (uses tpu_info subprocess or torch_xla).",
+    )
+    parser.add_argument(
+        "--xla-spmd",
+        action="store_true",
+        help="Adjust TPU memory reporting for SPMD/replicated sharding.",
+    )
     parser.add_argument(
         "--global-batch",
         type=int,
@@ -331,10 +435,14 @@ def _make_batches(
 def _maybe_download_image(url: Optional[str]) -> Optional[np.ndarray]:
     if not url:
         return None
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    image = Image.open(io.BytesIO(response.content)).convert("RGB")
-    return np.array(image, dtype=np.uint8)
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        image = Image.open(io.BytesIO(response.content)).convert("RGB")
+        return np.array(image, dtype=np.uint8)
+    except Exception as exc:
+        print(f"Sample image fetch failed ({exc}); continuing without image.")
+        return None
 
 
 def _tree_to_floats(mapping: Optional[Dict[str, Any]]) -> Dict[str, float]:
@@ -669,10 +777,20 @@ def main() -> None:
         optimizer=optax.adafactor(learning_rate=1e-3),
     )
     print("✓ Trainer configured.")
+    _log_tpu_memory_event(
+        enabled=args.log_tpu_memory,
+        label="pre_training",
+        xla_spmd=args.xla_spmd,
+    )
     pre_state = None
     if not args.skip_pre_eval or sample_image is not None:
         pre_state = trainer.init_state()
         if not args.skip_pre_eval:
+            _log_tpu_memory_event(
+                enabled=args.log_tpu_memory,
+                label="pre_training_eval/pre",
+                xla_spmd=args.xla_spmd,
+            )
             _run_evaluator(
                 trainer=trainer,
                 state=pre_state,
@@ -680,7 +798,17 @@ def main() -> None:
                 jsonl_path=metrics_jsonl_path,
                 wandb_handle=wandb_handle,
             )
+            _log_tpu_memory_event(
+                enabled=args.log_tpu_memory,
+                label="pre_training_eval/post",
+                xla_spmd=args.xla_spmd,
+            )
         if sample_image is not None:
+            _log_tpu_memory_event(
+                enabled=args.log_tpu_memory,
+                label="chat_sample/pre_training/pre",
+                xla_spmd=args.xla_spmd,
+            )
             _run_chat_sample(
                 label="pre_training",
                 model=model,
@@ -692,10 +820,20 @@ def main() -> None:
                 wandb_handle=wandb_handle,
                 run_dir=run_dir,
             )
+            _log_tpu_memory_event(
+                enabled=args.log_tpu_memory,
+                label="chat_sample/pre_training/post",
+                xla_spmd=args.xla_spmd,
+            )
 
     print(f"\n6. Starting training for {planned_train_steps} steps...")
     state, aux = trainer.train()
     print("\n✓ Training finished.")
+    _log_tpu_memory_event(
+        enabled=args.log_tpu_memory,
+        label="post_training",
+        xla_spmd=args.xla_spmd,
+    )
 
     if aux is not None:
         try:
@@ -712,12 +850,22 @@ def main() -> None:
             )
 
     print("\n7. Running evaluations and chat sampling...")
+    _log_tpu_memory_event(
+        enabled=args.log_tpu_memory,
+        label="post_training_eval/pre",
+        xla_spmd=args.xla_spmd,
+    )
     _run_evaluator(
         trainer=trainer,
         state=state,
         label="post_training_eval",
         jsonl_path=metrics_jsonl_path,
         wandb_handle=wandb_handle,
+    )
+    _log_tpu_memory_event(
+        enabled=args.log_tpu_memory,
+        label="post_training_eval/post",
+        xla_spmd=args.xla_spmd,
     )
 
     if sample_image is not None:
