@@ -10,14 +10,13 @@ import logging
 def setup_config():
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s]: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format="%(message)s",
+        datefmt="%H:%M:%S",
         handlers=[RichHandler()],
     )
 
 
 setup_config()
-# Log the log_postfix value
 logger = logging.getLogger("rich")
 console = Console()
 

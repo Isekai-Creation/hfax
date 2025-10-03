@@ -61,8 +61,72 @@ def _tpuinfo_cli_query_text() -> Optional[List[Dict[str, int]]]:
         return None
 
 
+def _tpuinfo_py_subprocess() -> Optional[List[Dict[str, int]]]:
+    """Call python -c to use tpu_info module when CLI lacks totals.
+
+    Returns list of dicts {'total': bytes, 'used': bytes} per device.
+    """
+    code = r'''
+import json
+try:
+  from tpu_info import device as tpu_device
+  from tpu_info import metrics as tpu_metrics
+  chip_type, count = tpu_device.get_local_chips()
+  if not chip_type or not count:
+    raise SystemExit(2)
+  device_usage = tpu_metrics.get_chip_usage(chip_type)
+  per_chip = [{"total": int(d.total_memory), "used": int(d.memory_usage)} for d in device_usage]
+  print(json.dumps(per_chip))
+  raise SystemExit(0)
+except Exception:
+  raise SystemExit(1)
+'''
+    try:
+        proc = subprocess.run(["python", "-c", code], check=False, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout.strip())
+        out = []
+        for d in data:
+            t = int(d.get("total", 0))
+            u = int(d.get("used", 0))
+            if t > 0:
+                out.append({"total": t, "used": u})
+        return out or None
+    except Exception:
+        return None
+
+
+def _tpuinfo_usage_table() -> Optional[List[int]]:
+    """Parse `tpu-info --metric hbm_usage` table and return per-device used bytes.
+
+    Only returns used (GiB); total may not be exposed by CLI.
+    """
+    try:
+        proc = subprocess.run(["tpu-info", "--metric", "hbm_usage"], check=False, capture_output=True, text=True, timeout=8)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    useds: List[int] = []
+    for line in proc.stdout.splitlines():
+        # Match rows like: "│ 0      │ 12.34           │"
+        if "HBM Usage" in line or "Device" in line:
+            continue
+        m = re.search(r"\|\s*\d+\s*\|\s*([0-9]+(?:\.[0-9]+)?)\s*\|", line.replace("│", "|"))
+        if m:
+            gib = float(m.group(1))
+            useds.append(int(gib * (1 << 30)))
+    return useds or None
+
+
 def _query_chips() -> Optional[List[Dict[str, int]]]:
-    return _tpuinfo_cli_query_json() or _tpuinfo_cli_query_text()
+    return _tpuinfo_cli_query_json() or _tpuinfo_cli_query_text() or (
+        None if _tpuinfo_usage_table() is None else [{"total": 0, "used": u} for u in _tpuinfo_usage_table() or []]
+    ) or _tpuinfo_py_subprocess()
 
 
 def get_xla_mem_info() -> Tuple[int, int]:
@@ -114,8 +178,11 @@ def per_replica_free_total() -> Optional[Tuple[int, int]]:
     chips = _query_chips()
     if not chips:
         return None
-    totals = [int(c["total"]) for c in chips]
-    useds = [int(c["used"]) for c in chips]
+    totals = [int(c.get("total", 0)) for c in chips]
+    useds = [int(c.get("used", 0)) for c in chips]
+    if not totals and useds:
+        # Only useds available (no total from CLI). Can't compute free/total; return None.
+        return None
     if not totals:
         return None
     per_total = min(totals)

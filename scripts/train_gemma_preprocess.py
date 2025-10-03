@@ -34,6 +34,7 @@ from jax import errors as jax_errors
 from PIL import Image
 from grain import python as grain
 from transformers import AutoProcessor
+from hfax.utils.batch_tuner import BucketBatchTuner
 from hfax.utils.tpu_mem import log_tpu_memory, XLAMemoryTimer, per_replica_free_total
 from hfax.utils.logging import logger
 
@@ -137,6 +138,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=MAX_DYNAMIC_BATCH_DEFAULT,
         help="Upper bound for dynamically scaled batch size (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--batch-expand-depth",
+        type=int,
+        default=2,
+        help="Midpoint expansion depth for candidate batches (0 disables).",
+    )
+    parser.add_argument(
+        "--batch-expand-max",
+        type=int,
+        default=8,
+        help="Max number of midpoint expansions to add.",
     )
     parser.add_argument(
         "--train-split",
@@ -314,6 +327,7 @@ def _prepare_bucketed_samples(
     processor: AutoProcessor,
     seed: int,
     max_length: int = max(BUCKET_BOUNDARIES),
+    max_per_bucket: int | None = None,
 ) -> Tuple[Dict[int, List[Dict[str, np.ndarray]]], Dict[str, Any]]:
     dataset = load_dataset(
         DATASET_PATH,
@@ -328,6 +342,7 @@ def _prepare_bucketed_samples(
     bucket_samples: Dict[int, List[Dict[str, np.ndarray]]] = {
         boundary: [] for boundary in BUCKET_BOUNDARIES
     }
+    max_per_bucket = None if max_per_bucket is None else max(1, int(max_per_bucket))
     dropped_long = 0
     total_examples = len(dataset)
     max_workers = CPU_COUNT
@@ -387,8 +402,27 @@ def _prepare_bucketed_samples(
             "loss_mask": loss_mask,
         }
 
-    # Prefer process-based parallelism for heavier CPU work if available.
-    if process_map is not None and max_workers > 1:
+    def _bucket_full() -> bool:
+        if max_per_bucket is None:
+            return False
+        return all(len(bucket_samples[b]) >= max_per_bucket for b in bucket_samples)
+
+    # Prefer process-based parallelism for heavier CPU work if available, unless capped.
+    if max_per_bucket is not None:
+        rng = random.Random(seed)
+        indices = list(range(total_examples))
+        rng.shuffle(indices)
+        for idx in indices:
+            bucket_size, sample = _process_single(dataset[idx])
+            if bucket_size is None or sample is None:
+                dropped_long += 1
+                continue
+            if len(bucket_samples[bucket_size]) >= max_per_bucket:
+                continue
+            bucket_samples[bucket_size].append(sample)
+            if _bucket_full():
+                break
+    elif process_map is not None and max_workers > 1:
         workers = max(1, min(max_workers, 32))
         chunk_size = max(64, total_examples // workers)
         chunks: List[Tuple[int, int]] = []
@@ -1064,45 +1098,41 @@ def main() -> None:
         train_batch_size = eval_batch_size = max(1, int(args.force_batch_size))
         print(f"[batch-tuning] Forcing batch size to {train_batch_size} via --force-batch-size.")
     else:
-        # If allowed, estimate an upper bound from live TPU memory and cap search.
-        if args.no_live_memory_query:
-            print("[batch-tuning] Live memory queries disabled (--no-live-memory-query).")
-            upper_hint = None
-        else:
-            upper_hint = _estimate_upper_batch_from_tpu_memory(
-                bucket_samples=train_bucket_samples,
-                validator=(train_validator if train_validator is not None else (lambda _: True)),
+        # Prefer native tuner using TPU memory; falls back to validator-only.
+        tuned_global: Optional[int] = None
+        if not args.no_live_memory_query:
+            tuner = BucketBatchTuner(
+                base_batch_size=BASE_BATCH_SIZE,
                 max_dynamic_batch=args.max_dynamic_batch,
+                safety_ratio=0.05,
+                safety_min_bytes=(1 << 30),
                 verbose=(args.log_batch_tuning or args.log_tpu_memory),
+                use_candidate_expansion=(args.batch_expand_depth > 0 and args.batch_expand_max > 0),
+                candidate_depth=max(0, int(args.batch_expand_depth)),
+                candidate_expansions=max(0, int(args.batch_expand_max)),
             )
-        # Use memory-derived upper bound whenever available (validator optional)
-        if upper_hint is not None:
-            print(f"Using TPU memory-derived upper batch bound: {upper_hint}")
-            train_max = min(args.max_dynamic_batch, upper_hint)
+            tune_res = tuner.tune_for_buckets(
+                bucket_samples=train_bucket_samples,
+                trainstep=validation_trainstep,
+            )
+            if tune_res is not None and tune_res.best_per_bucket:
+                print("[batch-tuning] per-bucket best sizes:", tune_res.best_per_bucket)
+                tuned_global = min(tune_res.best_per_bucket.values())
+                print(f"[batch-tuning] derived global batch size: {tuned_global}")
+        if tuned_global is None:
+            # Fallback to validator-driven global search
+            train_batch_size = _compute_dynamic_batch_size(
+                train_stats["bucket_counts"],
+                max_dynamic_batch=args.max_dynamic_batch,
+                validator=train_validator,
+            )
+            eval_batch_size = _compute_dynamic_batch_size(
+                eval_stats["bucket_counts"],
+                max_dynamic_batch=args.max_dynamic_batch,
+                validator=eval_validator,
+            )
         else:
-            if args.skip_oom_validator:
-                # Be conservative when validator is off.
-                train_max = min(args.max_dynamic_batch, max(BASE_BATCH_SIZE, BASE_BATCH_SIZE * 2))
-                print(f"[batch-tuning] Validator disabled; capping train max to {train_max}.")
-            else:
-                train_max = args.max_dynamic_batch
-
-        train_batch_size = _compute_dynamic_batch_size(
-            train_stats["bucket_counts"],
-            max_dynamic_batch=train_max,
-            validator=train_validator,
-        )
-
-        # For eval, reuse the same cap; eval usually uses identical shapes.
-        if args.skip_oom_validator:
-            eval_upper = min(args.max_dynamic_batch, train_max)
-        else:
-            eval_upper = upper_hint if upper_hint is not None else args.max_dynamic_batch
-        eval_batch_size = _compute_dynamic_batch_size(
-            eval_stats["bucket_counts"],
-            max_dynamic_batch=eval_upper,
-            validator=eval_validator,
-        )
+            train_batch_size = eval_batch_size = tuned_global
 
     train_batched_samples, train_utilized, train_dropped = _create_batched_samples(
         train_bucket_samples,
