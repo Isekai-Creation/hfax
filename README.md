@@ -69,6 +69,16 @@ Additionally, our
 [examples/](https://github.com/google-deepmind/gemma/tree/main/examples) folder
 contain additional scripts to fine-tune and sample with Hfax.
 
+### Scripts Layout
+
+- Training entrypoints are available under `scripts/train/`:
+  - `scripts/train/train_any_preprocess.py` (wrapper for the unified trainer at `scripts/train_any_preprocess.py`).
+  - `scripts/train/train_gemma_preprocess.py` (wrapper for `scripts/train_gemma_preprocess.py`).
+  - TPU-ready bash helpers: `scripts/train/train_any_preprocess_fixed_tpu.sh`, `scripts/train/train_gemma_preprocess_{fixed,dynamic}_tpu.sh`.
+- Inference and utility runners live under `scripts/inference/`.
+
+For HF models, you can define the model and processor IDs in bash via `HF_MODEL_ID` and `HF_PROCESSOR_ID`, or pass `--model-id` and `--processor-id` flags to the Python script. Logging is standardized through `hfax/utils/logging.py`.
+
 ### Learn more about Gemma
 
 * To use this library: [Gemma documentation](https://gemma-llm.readthedocs.io/)

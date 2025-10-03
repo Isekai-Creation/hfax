@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fine-tune Gemma3 4B with dynamic batching driven by bucket statistics."""
+"""Unified Gemma3 preprocessing/training: dynamic or fixed mode.
+
+Use --fixed-max-length and --fixed-batch-size for the fixed (non-dynamic) path,
+or omit them to enable dynamic bucketing and batch-size tuning.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +26,10 @@ import optax
 import requests
 from datasets import load_dataset
 from etils import enp
+try:
+    from tqdm.contrib.concurrent import process_map  # type: ignore
+except Exception:
+    process_map = None  # type: ignore
 from jax import errors as jax_errors
 from PIL import Image
 from grain import python as grain
@@ -56,7 +64,7 @@ EVAL_NUM_WORKERS = max(1, min(32, CPU_COUNT))
 CHECKPOINT_ROOT = Path("/dev/shm/kauldron_runs")
 
 # Memory provider selection: only torch_xla in this environment
-MEM_PROVIDER = "torch_xla"
+MEM_PROVIDER = "tpu_info"
 
 # -----------------------------------------------------------------------------
 # CLI
@@ -81,11 +89,6 @@ def parse_args() -> argparse.Namespace:
         help="Disable live TPU memory querying during batch tuning/logging (stability mode).",
     )
     parser.add_argument(
-        "--xla-spmd",
-        action="store_true",
-        help="When logging TPU memory, adjust readings for XLA SPMD/FSDP mode.",
-    )
-    parser.add_argument(
         "--skip-oom-validator",
         action="store_true",
         help="Skip JAX-based OOM validator during batch tuning (stability workaround).",
@@ -104,10 +107,22 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated token boundaries for buckets (e.g. '512' or '512,1024').",
     )
     parser.add_argument(
+        "--fixed-max-length",
+        type=int,
+        default=None,
+        help="If set, use a single fixed max sequence length for padding/bucketing.",
+    )
+    parser.add_argument(
         "--force-batch-size",
         type=int,
         default=None,
         help="If set, bypass dynamic search and force this batch size for train/eval.",
+    )
+    parser.add_argument(
+        "--fixed-batch-size",
+        type=int,
+        default=None,
+        help="Alias for --force-batch-size (fixed global batch size).",
     )
     parser.add_argument(
         "--max-dynamic-batch",
@@ -228,6 +243,63 @@ def _collect_image_token_ids(processor: AutoProcessor, pad_token_id: int) -> set
     return image_token_ids
 
 
+def _process_chunk_worker(args: Tuple[str, str, str, str, Tuple[int, ...], int, str, int, int]) -> List[Tuple[int | None, Dict[str, np.ndarray] | None]]:
+    """Picklable top-level worker for process_map.
+
+    Args:
+      args: (dataset_path, split, cache_dir, model_id, boundaries, max_length, instruction, start, end)
+    Returns:
+      List of (bucket_size, sample_dict) pairs (may include (None, None)).
+    """
+    dataset_path, split, cache_dir, model_id, boundaries, max_length, instruction, start, end = args
+    proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    ds_local = load_dataset(dataset_path, split=split, cache_dir=cache_dir).with_format("python")
+    pad_token_id = proc.tokenizer.pad_token_id
+    image_token_ids = _collect_image_token_ids(proc, pad_token_id)
+    out: List[Tuple[int | None, Dict[str, np.ndarray] | None]] = []
+    for idx in range(start, end):
+        ex = ds_local[idx]
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {"type": "image", "image": ex["image"]},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": ex["text"]}],
+            },
+        ]
+        rendered_prompt = proc.apply_chat_template(
+            conversation, add_generation_prompt=False, tokenize=False
+        )
+        encoded = proc(
+            text=[rendered_prompt],
+            images=[ex["image"].convert("RGB")],
+            return_tensors="np",
+            padding=False,
+            max_length=max_length,
+            truncation=True,
+        )
+        input_ids = encoded["input_ids"][0].astype(np.int32)
+        bucket_size = next((b for b in boundaries if len(input_ids) <= b), None)
+        if bucket_size is None:
+            out.append((None, None))
+            continue
+        padded_input = np.full((bucket_size,), pad_token_id, dtype=np.int32)
+        padded_input[: len(input_ids)] = input_ids
+        labels = padded_input.copy()
+        if image_token_ids:
+            labels[np.isin(labels, list(image_token_ids))] = -100
+        labels[labels == pad_token_id] = -100
+        targets = labels[:, None]
+        loss_mask = (targets != -100).astype(np.int32)
+        out.append((bucket_size, {"input": padded_input, "target": targets, "loss_mask": loss_mask}))
+    return out
+
+
 def _prepare_bucketed_samples(
     *,
     split: str,
@@ -307,24 +379,53 @@ def _prepare_bucketed_samples(
             "loss_mask": loss_mask,
         }
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        iterator: Iterable[Tuple[int | None, Dict[str, np.ndarray] | None]] = (
-            executor.map(_process_single, dataset)
-        )
-        if tqdm is not None:
-            iterator = tqdm(
-                iterator,
-                total=total_examples,
-                desc=f"[{split}]",
-                unit="sample",
-                leave=True,
-            )
-
-        for bucket_size, sample in iterator:
-            if bucket_size is None or sample is None:
-                dropped_long += 1
-                continue
-            bucket_samples[bucket_size].append(sample)
+    # Prefer process-based parallelism for heavier CPU work if available.
+    if process_map is not None and max_workers > 1:
+        workers = max(1, min(max_workers, 32))
+        chunk_size = max(64, total_examples // workers)
+        chunks: List[Tuple[int, int]] = []
+        s = 0
+        while s < total_examples:
+            e = min(total_examples, s + chunk_size)
+            chunks.append((s, e))
+            s = e
+        task_args = [
+            (DATASET_PATH, split, DATA_CACHE_DIR, MODEL_ID, BUCKET_BOUNDARIES, max_length, INSTRUCTION, st, ed)
+            for (st, ed) in chunks
+        ]
+        for res in process_map(_process_chunk_worker, task_args, max_workers=workers, desc=f"[{split}] chunks", unit="chunk"):
+            for bucket_size, sample in res:
+                if bucket_size is None or sample is None:
+                    dropped_long += 1
+                    continue
+                bucket_samples[bucket_size].append(sample)
+    else:
+        # Threaded fallback with smooth progress
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_single, ex) for ex in dataset]
+            if tqdm is not None:
+                for fut in tqdm(
+                    concurrent.futures.as_completed(futures),
+                    total=total_examples,
+                    desc=f"[{split}]",
+                    unit="sample",
+                    leave=True,
+                    dynamic_ncols=True,
+                    miniters=1,
+                    mininterval=0.1,
+                ):
+                    bucket_size, sample = fut.result()
+                    if bucket_size is None or sample is None:
+                        dropped_long += 1
+                        continue
+                    bucket_samples[bucket_size].append(sample)
+            else:
+                for fut in concurrent.futures.as_completed(futures):
+                    bucket_size, sample = fut.result()
+                    if bucket_size is None or sample is None:
+                        dropped_long += 1
+                        continue
+                    bucket_samples[bucket_size].append(sample)
 
     stats = {
         "total_examples": total_examples,
@@ -542,7 +643,7 @@ def _maybe_init_wandb(args: argparse.Namespace, run_dir: Path) -> Optional[Wandb
         "train_split": args.train_split,
         "eval_split": args.eval_split,
         "log_tpu_memory": args.log_tpu_memory,
-        "xla_spmd": args.xla_spmd,
+        
     }
     run = wandb.init(
         project=args.wandb_project,
@@ -681,63 +782,38 @@ def _run_chat_sample(
 # -----------------------------------------------------------------------------
 
 
-def _maybe_log_tpu_memory(*, log_memory: bool, xla_spmd: bool) -> None:
+def _maybe_log_tpu_memory(*, log_memory: bool) -> None:
     if not log_memory:
         return
 
     mem_total = mem_used = mem_free = 0
 
     # Try external Python 3.10 helper first
-    ext = _tpuinfo_cli_query(spmd=xla_spmd)
+    ext = _tpuinfo_cli_query(spmd=True)
     if ext is not None:
         mem_free, mem_total = ext
         mem_used = max(0, mem_total - mem_free)
     else:
-        if xla_spmd:
-            sub = _tpu_info_query_subprocess()
-            if sub is not None:
-                mem_free, mem_total = sub
-                mem_used = max(0, mem_total - mem_free)
-            else:
-                # Fallback to torch_xla single-device reading.
-                try:
-                    import torch_xla.core.xla_model as xm  # type: ignore
-                    device = xm.xla_device()
-                    mem_info = xm.get_memory_info(device)
-                    mem_used = mem_info.get("bytes_used", 0)
-                    mem_total = mem_info.get("bytes_limit", 0)
-                    mem_free = max(0, mem_total - mem_used)
-                    print("tpu-info unavailable; fell back to torch_xla memory for logging.")
-                except Exception as exc:  # pragma: no cover
-                    print(f"Failed to query TPU memory: {exc}")
-                    return
+        sub = _tpu_info_query_subprocess()
+        if sub is not None:
+            mem_free, mem_total = sub
+            mem_used = max(0, mem_total - mem_free)
         else:
-            try:
-                import torch_xla.core.xla_model as xm  # type: ignore
-                device = xm.xla_device()
-                mem_info = xm.get_memory_info(device)
-                mem_used = mem_info.get("bytes_used", 0)
-                mem_total = mem_info.get("bytes_limit", 0)
-                mem_free = max(0, mem_total - mem_used)
-            except Exception as exc:  # pragma: no cover - diagnostics only
-                print(f"Failed to query torch_xla memory info: {exc}")
-                return
+            print("Failed to query TPU memory via tpu_info.")
+            return
 
     if mem_total:
-        label = (
+        print(
             f"TPU memory (per-replica): used={mem_used / 1e9:.2f} GB, "
             f"free={mem_free / 1e9:.2f} GB, total={mem_total / 1e9:.2f} GB"
-            if xla_spmd
-            else f"TPU memory usage: {mem_used / 1e9:.2f} / {mem_total / 1e9:.2f} GB (used/total)"
         )
-        print(label)
 
 
-def _log_tpu_memory_event(*, enabled: bool, label: str, xla_spmd: bool) -> None:
+def _log_tpu_memory_event(*, enabled: bool, label: str) -> None:
     if not enabled:
         return
     print(f"[mem] {label}:")
-    _maybe_log_tpu_memory(log_memory=True, xla_spmd=xla_spmd)
+    _maybe_log_tpu_memory(log_memory=True)
 
 
 # -----------------------------------------------------------------------------
@@ -745,7 +821,7 @@ def _log_tpu_memory_event(*, enabled: bool, label: str, xla_spmd: bool) -> None:
 # -----------------------------------------------------------------------------
 
 
-def _tpu_memory_free_and_total(xla_spmd: bool) -> Optional[Tuple[int, int]]:
+def _tpu_memory_free_and_total() -> Optional[Tuple[int, int]]:
     """Return (free_bytes, total_bytes) per replica if available.
 
     Uses tpu_info when available and falls back to torch_xla. Returns None if no
@@ -760,27 +836,14 @@ def _tpu_memory_free_and_total(xla_spmd: bool) -> Optional[Tuple[int, int]]:
         return None
 
     # Prefer external Python 3.10 helper script first.
-    res = _tpuinfo_cli_query(spmd=xla_spmd)
+    res = _tpuinfo_cli_query(spmd=True)
     if res is not None:
         return res
 
-    # Then try in-process tpu_info (may crash on py3.12; kept as best-effort)
+    # Then try in-process tpu_info (subprocess Python 3.12 safe)
     res = _tpu_info_query_subprocess()
     if res is not None:
         return res
-
-    # Fallback: torch_xla (single device view; free = limit - used)
-    try:
-        import torch_xla.core.xla_model as xm  # type: ignore
-        device = xm.xla_device()
-        mem_info = xm.get_memory_info(device)
-        total = int(mem_info.get("bytes_limit", 0))
-        used = int(mem_info.get("bytes_used", 0))
-        free = max(0, total - used)
-        if total > 0:
-            return free, total
-    except Exception:
-        pass
 
     return None
 
@@ -917,7 +980,6 @@ def _estimate_upper_batch_from_tpu_memory(
     bucket_samples: Dict[int, List[Dict[str, np.ndarray]]],
     validator: Callable[[int], bool],
     max_dynamic_batch: int,
-    xla_spmd: bool,
     verbose: bool = False,
 ) -> Optional[int]:
     """Estimate a safe upper bound for batch size using live TPU memory.
@@ -931,7 +993,7 @@ def _estimate_upper_batch_from_tpu_memory(
       downward until success.
     Returns None if no memory provider is available.
     """
-    mem = _tpu_memory_free_and_total(xla_spmd)
+    mem = _tpu_memory_free_and_total()
     if mem is None:
         if verbose:
             print("[batch-tuning] No TPU memory provider available; using OOM-guided search only.")
@@ -947,7 +1009,7 @@ def _estimate_upper_batch_from_tpu_memory(
         if verbose:
             print("[batch-tuning] Failed at BASE_BATCH_SIZE; aborting memory-based cap.")
         return None
-    post_mem = _tpu_memory_free_and_total(xla_spmd)
+    post_mem = _tpu_memory_free_and_total()
     if post_mem is None:
         if verbose:
             print("[batch-tuning] Post-step memory read failed; aborting memory-based cap.")
@@ -1031,9 +1093,16 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
     print("✓ Tokenizer initialized.")
 
-    # Optionally override bucket boundaries from CLI.
+    # Normalize fixed-batch alias
+    if getattr(args, 'fixed_batch_size', None) is not None and args.force_batch_size is None:
+        args.force_batch_size = int(args.fixed_batch_size)
+
+    # Optionally override bucket boundaries or switch to fixed-max mode
     global BUCKET_BOUNDARIES
-    if args.bucket_boundaries:
+    if args.fixed_max_length is not None:
+        BUCKET_BOUNDARIES = (int(args.fixed_max_length),)
+        print(f"[config] Fixed max length enabled: {BUCKET_BOUNDARIES[0]} tokens.")
+    elif args.bucket_boundaries:
         try:
             BUCKET_BOUNDARIES = tuple(int(x.strip()) for x in args.bucket_boundaries.split(",") if x.strip())
             if not BUCKET_BOUNDARIES:
@@ -1113,6 +1182,7 @@ def main() -> None:
             trainstep=validation_trainstep,
         )
 
+    upper_hint: Optional[int] = None
     if args.force_batch_size is not None:
         train_batch_size = eval_batch_size = max(1, int(args.force_batch_size))
         print(f"[batch-tuning] Forcing batch size to {train_batch_size} via --force-batch-size.")
@@ -1126,37 +1196,36 @@ def main() -> None:
                 bucket_samples=train_bucket_samples,
                 validator=(train_validator if train_validator is not None else (lambda _: True)),
                 max_dynamic_batch=args.max_dynamic_batch,
-                xla_spmd=args.xla_spmd,
                 verbose=(args.log_batch_tuning or args.log_tpu_memory),
             )
-    # Use memory-derived upper bound whenever available (validator optional)
-    if upper_hint is not None:
-        print(f"Using TPU memory-derived upper batch bound: {upper_hint}")
-        train_max = min(args.max_dynamic_batch, upper_hint)
-    else:
-        if args.skip_oom_validator:
-            # Be conservative when validator is off.
-            train_max = min(args.max_dynamic_batch, max(BASE_BATCH_SIZE, BASE_BATCH_SIZE * 2))
-            print(f"[batch-tuning] Validator disabled; capping train max to {train_max}.")
+        # Use memory-derived upper bound whenever available (validator optional)
+        if upper_hint is not None:
+            print(f"Using TPU memory-derived upper batch bound: {upper_hint}")
+            train_max = min(args.max_dynamic_batch, upper_hint)
         else:
-            train_max = args.max_dynamic_batch
+            if args.skip_oom_validator:
+                # Be conservative when validator is off.
+                train_max = min(args.max_dynamic_batch, max(BASE_BATCH_SIZE, BASE_BATCH_SIZE * 2))
+                print(f"[batch-tuning] Validator disabled; capping train max to {train_max}.")
+            else:
+                train_max = args.max_dynamic_batch
 
-    train_batch_size = _compute_dynamic_batch_size(
-        train_stats["bucket_counts"],
-        max_dynamic_batch=train_max,
-        validator=train_validator,
-    )
+        train_batch_size = _compute_dynamic_batch_size(
+            train_stats["bucket_counts"],
+            max_dynamic_batch=train_max,
+            validator=train_validator,
+        )
 
-    # For eval, reuse the same cap; eval usually uses identical shapes.
-    if args.skip_oom_validator:
-        eval_upper = min(args.max_dynamic_batch, train_max)
-    else:
-        eval_upper = upper_hint if upper_hint is not None else args.max_dynamic_batch
-    eval_batch_size = _compute_dynamic_batch_size(
-        eval_stats["bucket_counts"],
-        max_dynamic_batch=eval_upper,
-        validator=eval_validator,
-    )
+        # For eval, reuse the same cap; eval usually uses identical shapes.
+        if args.skip_oom_validator:
+            eval_upper = min(args.max_dynamic_batch, train_max)
+        else:
+            eval_upper = upper_hint if upper_hint is not None else args.max_dynamic_batch
+        eval_batch_size = _compute_dynamic_batch_size(
+            eval_stats["bucket_counts"],
+            max_dynamic_batch=eval_upper,
+            validator=eval_validator,
+        )
 
     train_batched_samples, train_utilized, train_dropped = _create_batched_samples(
         train_bucket_samples,
@@ -1307,7 +1376,7 @@ def main() -> None:
     _log_tpu_memory_event(
         enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
         label="pre_training",
-        xla_spmd=args.xla_spmd,
+        
     )
 
     pre_state = None
@@ -1317,7 +1386,7 @@ def main() -> None:
             _log_tpu_memory_event(
                 enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
                 label="pre_training_eval/pre",
-                xla_spmd=args.xla_spmd,
+                
             )
             _run_evaluator(
                 trainer=trainer,
@@ -1329,13 +1398,13 @@ def main() -> None:
             _log_tpu_memory_event(
                 enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
                 label="pre_training_eval/post",
-                xla_spmd=args.xla_spmd,
+                
             )
         if sample_image is not None:
             _log_tpu_memory_event(
                 enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
                 label="chat_sample/pre_training/pre",
-                xla_spmd=args.xla_spmd,
+                
             )
             _run_chat_sample(
                 label="pre_training",
@@ -1351,7 +1420,6 @@ def main() -> None:
             _log_tpu_memory_event(
                 enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
                 label="chat_sample/pre_training/post",
-                xla_spmd=args.xla_spmd,
             )
 
     print(f"\n6. Starting training for {len(train_ds)} steps...")
@@ -1368,7 +1436,7 @@ def main() -> None:
         _log_tpu_memory_event(
             enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
             label="post_training",
-            xla_spmd=args.xla_spmd,
+            
         )
 
     if aux is not None:
@@ -1390,7 +1458,7 @@ def main() -> None:
         _log_tpu_memory_event(
             enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
             label="post_training_eval/pre",
-            xla_spmd=args.xla_spmd,
+            
         )
         _run_evaluator(
             trainer=trainer,
@@ -1402,7 +1470,7 @@ def main() -> None:
         _log_tpu_memory_event(
             enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
             label="post_training_eval/post",
-            xla_spmd=args.xla_spmd,
+            
         )
 
     if sample_image is not None:

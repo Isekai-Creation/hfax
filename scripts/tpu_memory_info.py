@@ -111,62 +111,18 @@ def _query_with_tpu_info(spmd: bool) -> Optional[MemSnapshot]:
         return None
 
 
-def _query_with_torch_xla(spmd: bool) -> Optional[MemSnapshot]:
-    try:
-        import torch_xla.core.xla_model as xm  # type: ignore
-    except Exception:
-        return None
-    try:
-        dev = xm.xla_device()
-        info = xm.get_memory_info(dev)
-        total = int(info.get("bytes_limit", 0))
-        used = int(info.get("bytes_used", 0))
-        chip = ChipUsage(total_memory=total, memory_usage=used)
-        per_total = per_used = per_free = None
-        if spmd:
-            per_total, per_used, per_free = _calc_per_replica_spmd([chip])
-        return MemSnapshot(
-            provider="torch_xla",
-            timestamp=_iso_now(),
-            spmd=spmd,
-            chip_count=1 if total > 0 else 0,
-            chips=[chip] if total > 0 else [],
-            per_replica_total=per_total,
-            per_replica_used=per_used,
-            per_replica_free=per_free,
-        )
-    except Exception:
-        return None
-
-
-def query_memory(spmd: bool, provider: str) -> MemSnapshot:
+def query_memory(spmd: bool) -> MemSnapshot:
     """Query TPU memory.
 
     Args:
       spmd: Interpret results under SPMD semantics.
-      provider: 'auto' | 'tpu_info' | 'torch_xla'
     Returns:
       MemSnapshot (raises RuntimeError if no provider works).
     """
-    if provider not in ("auto", "tpu_info", "torch_xla"):
-        raise ValueError("provider must be 'auto', 'tpu_info', or 'torch_xla'")
-
-    order: List[str]
-    if provider == "auto":
-        order = ["tpu_info", "torch_xla"]
-    else:
-        order = [provider]
-
-    last: Optional[MemSnapshot] = None
-    for prov in order:
-        if prov == "tpu_info":
-            snap = _query_with_tpu_info(spmd)
-        else:
-            snap = _query_with_torch_xla(spmd)
-        if snap is not None and (snap.chip_count > 0 or (snap.chips and snap.chips[0].total_memory > 0)):
-            return snap
-        last = snap
-    raise RuntimeError("No TPU memory provider available (tpu_info/torch_xla)")
+    snap = _query_with_tpu_info(spmd)
+    if snap is None:
+        raise RuntimeError("tpu_info is required to query TPU memory")
+    return snap
 
 
 def _print_human(snap: MemSnapshot) -> None:
@@ -189,7 +145,7 @@ def _print_human(snap: MemSnapshot) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--provider", choices=["auto", "tpu_info", "torch_xla"], default="auto")
+    # tpu_info is the only provider supported
     ap.add_argument("--spmd", action="store_true", help="Interpret results as SPMD per-replica")
     ap.add_argument("--format", choices=["human", "json"], default="human")
     ap.add_argument("--watch", type=int, default=1, help="Number of samples to take (default: 1)")
@@ -198,7 +154,7 @@ def main() -> None:
 
     for i in range(max(1, args.watch)):
         try:
-            snap = query_memory(spmd=args.spmd, provider=args.provider)
+            snap = query_memory(spmd=args.spmd)
         except Exception as exc:
             print(f"TPU memory query failed: {exc}", file=sys.stderr)
             sys.exit(2)
@@ -213,4 +169,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

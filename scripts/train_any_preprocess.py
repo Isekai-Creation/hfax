@@ -1,17 +1,44 @@
 #!/usr/bin/env python3
-"""Unified Gemma3 preprocessing/training: dynamic or fixed mode.
+"""Unified training entrypoint (HF Qwen2.5-VL and Gemma3).
 
-Use --fixed-max-length and --fixed-batch-size for the fixed (non-dynamic) path,
-or omit them to enable dynamic bucketing and batch-size tuning.
+This script can run in 2 modes:
+  - HF/Qwen mode (default): trains/inits a Hugging Face model such as
+    "Qwen/Qwen2.5-VL-3B-Instruct" on CPU or GPU (PyTorch).
+  - Gemma3/Kauldron mode: retains the original Gemma3 Kauldron path with
+    dynamic preprocessing and batching.
+
+Select the mode with ``--model-id``. If it contains "Qwen", the HF path is
+used; otherwise the Gemma3 path is used. The Qwen path is intentionally kept
+minimal and dependency-light.
 """
 
 from __future__ import annotations
+import os
+
+# Set HF_HOME to /dev/shm/
+os.environ.setdefault("HF_HOME", "/dev/shm/")
+
+# IMPORT LOGGER BEFORE ANYTHING ELSE
+import time
+from rich.logging import RichHandler
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s]: %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[RichHandler()],
+)
+
+# Log the log_postfix value
+logger = logging.getLogger("rich")
+
+import hfax
 
 import argparse
 import concurrent.futures
 import io
 import json
-import os
 import random
 import time
 from dataclasses import dataclass
@@ -24,8 +51,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import requests
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
 from etils import enp
+
 try:
     from tqdm.contrib.concurrent import process_map  # type: ignore
 except Exception:
@@ -33,9 +61,13 @@ except Exception:
 from jax import errors as jax_errors
 from PIL import Image
 from grain import python as grain
-from transformers import AutoProcessor
+from transformers import (
+    AutoTokenizer,
+    AutoProcessor,
+)
+from huggingface_hub import snapshot_download
+import torch
 
-import hfax
 from kauldron import kd
 
 try:  # Optional progress bars
@@ -43,11 +75,138 @@ try:  # Optional progress bars
 except ImportError:  # pragma: no cover - tqdm optional
     tqdm = None
 
+# Structured logging via hfax.utils.logging
+
+# -----------------------------------------------------------------------------
+# Retry helpers for network-bound HF ops
+# -----------------------------------------------------------------------------
+
+
+def _retry_call(
+    fn,
+    *,
+    attempts: int = 3,
+    base_delay: float = 0.5,
+    max_delay: float = 4.0,
+    name: str = "op",
+):
+    """Run `fn()` with simple exponential backoff.
+
+    Returns fn()'s result or raises the last exception on final failure.
+    """
+    delay = base_delay
+    last_exc = None
+    for i in range(1, max(1, attempts) + 1):
+        try:
+            return fn()
+        except Exception as exc:  # pragma: no cover - network variability
+            last_exc = exc
+            if i >= attempts:
+                break
+            logger.warning(
+                "%s failed (attempt %d/%d): %s; retrying in %.1fs",
+                name,
+                i,
+                attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+            delay = min(max_delay, delay * 2.0)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _sanitize_repo_id(repo_id: str) -> str:
+    return repo_id.replace("/", "__").replace(" ", "_")
+
+
+HF_LOCAL_ROOT = Path(os.environ.get("HF_LOCAL_ROOT", "/dev/shm/hf_local"))
+HF_LOCAL_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_local_repo(
+    repo_id: str,
+    *,
+    repo_type: str = "model",
+    allow_patterns: Optional[List[str]] = None,
+) -> Path:
+    target = HF_LOCAL_ROOT / f"{repo_type}s" / _sanitize_repo_id(repo_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists() or not any(target.iterdir()):
+        snap_path = snapshot_download(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            local_dir=str(target),
+            local_dir_use_symlinks=True,
+            resume_download=True,
+            allow_patterns=allow_patterns,
+        )
+        _ = snap_path
+    return target
+
+
+def _load_processor_with_retry(model_id: str):
+    # Fetch only small processor/tokenizer files to avoid large weight downloads.
+    local_dir = _ensure_local_repo(
+        model_id,
+        repo_type="model",
+        allow_patterns=[
+            "tokenizer*",
+            "*processor_config.json",
+            "preprocessor_config.json",
+            "special_tokens_map.json",
+            "added_tokens.json",
+            "chat_template.*",
+            "generation_config.json",
+            "config.json",
+            "*.model",  # sentencepiece
+            "vocab.*",
+            "merges.txt",
+        ],
+    )
+    return AutoProcessor.from_pretrained(
+        str(local_dir), trust_remote_code=True, local_files_only=True
+    )
+
+
+_PROC_CACHE: Dict[str, AutoProcessor] = {}
+
+
+def _get_cached_processor(model_id: str) -> AutoProcessor:
+    proc = _PROC_CACHE.get(model_id)
+    if proc is None:
+        proc = _load_processor_with_retry(model_id)
+        _PROC_CACHE[model_id] = proc
+    return proc
+
+
+def _load_dataset_with_retry(dataset_path: str, *, split: str, cache_dir: str):
+    def _fn():
+        dc = DownloadConfig(max_retries=5)
+        return load_dataset(
+            dataset_path, split=split, cache_dir=cache_dir, download_config=dc
+        )
+
+    return _retry_call(
+        _fn,
+        attempts=3,
+        base_delay=0.5,
+        max_delay=4.0,
+        name=f"load_dataset({dataset_path}:{split})",
+    )
+
+
 # -----------------------------------------------------------------------------
 # Constants & defaults
 # -----------------------------------------------------------------------------
 
-MODEL_ID = "unsloth/gemma-3-4b-it"
+# Defaults
+MODEL_ID = os.environ.get("HF_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
+# Optional separate processor id; falls back to MODEL_ID if unset
+PROCESSOR_ID_ENV = os.environ.get("HF_PROCESSOR_ID")
+# Internal default for the Gemma/Kauldron path only.
+GEMMA_MODEL_ID = "unsloth/gemma-3-4b-it"
 BUCKET_BOUNDARIES = (512, 1024, 2048, 4096)
 BASE_BATCH_SIZE = 8  # tuned for 4K context
 MAX_DYNAMIC_BATCH_DEFAULT = 128
@@ -62,21 +221,61 @@ CPU_COUNT = os.cpu_count() or 1
 TRAIN_NUM_WORKERS = max(1, min(32, CPU_COUNT))
 EVAL_NUM_WORKERS = max(1, min(32, CPU_COUNT))
 CHECKPOINT_ROOT = Path("/dev/shm/kauldron_runs")
+Path(DATA_CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
-# Memory provider selection: only torch_xla in this environment
 MEM_PROVIDER = "tpu_info"
 
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
-    
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    # Mode selection / model
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        default=MODEL_ID,
+        help=(
+            "Hugging Face model id to load. If it contains 'Qwen', the script "
+            "uses the HF/PyTorch path. Otherwise the Gemma3/Kauldron path is used."
+        ),
+    )
+    parser.add_argument(
+        "--processor-id",
+        type=str,
+        default=PROCESSOR_ID_ENV,
+        help=("Hugging Face processor/tokenizer id to load (defaults to --model-id)."),
+    )
+    parser.add_argument(
+        "--hf-max-length",
+        type=int,
+        default=4096,
+        help="Max tokens for HF preprocessing (Qwen path).",
+    )
+    parser.add_argument(
+        "--hf-batch-size",
+        type=int,
+        default=1,
+        help="Global batch size for HF training (Qwen path).",
+    )
+    parser.add_argument(
+        "--hf-epochs",
+        type=int,
+        default=1,
+        help="Epochs for HF training (Qwen path).",
+    )
+    parser.add_argument(
+        "--hf-lr",
+        type=float,
+        default=1e-5,
+        help="Learning rate for HF training (Qwen path).",
+    )
     parser.add_argument(
         "--log-tpu-memory",
         action="store_true",
-        help="Print TPU memory usage before training (requires torch_xla or tpu-info).",
+        help="Print TPU memory usage before training (via tpu-info).",
     )
     parser.add_argument(
         "--log-batch-tuning",
@@ -99,7 +298,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("JAX_PLATFORM_NAME", "cpu"),
         help="Backend to target with JAX (default: %(default)s).",
     )
-    # No external python needed; we use torch_xla directly in py3.12.
+    # No external python needed; TPU memory checks use tpu-info when available.
     parser.add_argument(
         "--bucket-boundaries",
         type=str,
@@ -198,7 +397,129 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Weights & Biases run name.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not getattr(args, "processor_id", None):
+        args.processor_id = args.model_id
+    return args
+
+
+# -----------------------------------------------------------------------------
+# HF/Qwen path (PyTorch) — minimal and robust
+# -----------------------------------------------------------------------------
+
+
+def _collect_image_token_ids_hf(processor: AutoProcessor) -> set[int]:
+    pad_token_id = int(processor.tokenizer.pad_token_id)
+    ids: set[int] = set()
+    for key in ("boi_token", "eoi_token"):
+        token_value = processor.tokenizer.special_tokens_map.get(key)
+        if token_value is None:
+            continue
+        tokens = [token_value] if isinstance(token_value, str) else list(token_value)
+        for tok in tokens:
+            converted = processor.tokenizer.convert_tokens_to_ids(tok)
+            if converted is not None:
+                ids.add(int(converted))
+    placeholder_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    if placeholder_id is not None:
+        ids.add(int(placeholder_id))
+    ids.discard(pad_token_id)
+    # Historic placeholder sometimes used; harmless if unused in tokenizer.
+    ids.add(262144)
+    return ids
+
+
+def _build_hf_collate_fn(processor: AutoProcessor):
+    image_token_ids = _collect_image_token_ids_hf(processor)
+    pad_id = int(processor.tokenizer.pad_token_id)
+
+    # Optional Qwen vision helper
+    try:
+        from qwen_vl_utils import process_vision_info  # type: ignore
+    except Exception:  # pragma: no cover - optional dep
+        process_vision_info = None  # type: ignore
+
+    def collate(batch: list[dict[str, object]]) -> dict[str, torch.Tensor]:
+        texts: list[str] = []
+        images: list[object] = []
+        vision_infos_list = []
+        for ex in batch:
+            messages = ex["messages"]  # type: ignore[assignment]
+            # Render chat template to a plain string
+            text = processor.apply_chat_template(
+                messages, add_generation_prompt=False, tokenize=False
+            )
+            img = ex["image"]  # type: ignore[index]
+            if hasattr(img, "convert"):
+                img = img.convert("RGB")  # type: ignore[assignment]
+            texts.append(text)
+            images.append(img)
+            if process_vision_info is not None:
+                vision_infos_list.append(process_vision_info(messages))
+        # Prepare tensors; pass vision_infos if available
+        if vision_infos_list:
+            inputs = processor(
+                text=texts,
+                images=images,
+                vision_infos=vision_infos_list,  # type: ignore[arg-type]
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
+        else:
+            inputs = processor(
+                text=texts,
+                images=images,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
+        input_ids: torch.Tensor = inputs["input_ids"]  # (B, L)
+        labels = input_ids.clone()
+        if image_token_ids:
+            mask = torch.isin(
+                labels, torch.tensor(sorted(image_token_ids), dtype=labels.dtype)
+            )
+            labels[mask] = -100
+        labels[labels == pad_id] = -100
+        inputs["labels"] = labels
+        return inputs
+
+    return collate
+
+
+def _make_hf_datasets(
+    processor: AutoProcessor,
+    *,
+    split: str,
+    instruction: str,
+    max_examples: Optional[int] = None,
+):
+    """Return a PyTorch-friendly dataset with 'messages' and 'image' per row."""
+    ds = load_dataset(DATASET_PATH, split=split, cache_dir=DATA_CACHE_DIR)
+    if max_examples is not None:
+        ds = ds.select(range(min(len(ds), max_examples)))
+
+    def _map_fn(ex):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {"type": "image", "image": ex["image"]},
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": ex["text"]}]},
+        ]
+        return {"messages": messages, "image": ex["image"]}
+
+    ds = ds.map(
+        _map_fn,
+        remove_columns=[c for c in ds.column_names if c not in ("image", "text")],
+    )
+    # Switch to python objects to keep PIL Images
+    ds = ds.with_format("python")
+    return ds
 
 
 # -----------------------------------------------------------------------------
@@ -243,7 +564,9 @@ def _collect_image_token_ids(processor: AutoProcessor, pad_token_id: int) -> set
     return image_token_ids
 
 
-def _process_chunk_worker(args: Tuple[str, str, str, str, Tuple[int, ...], int, str, int, int]) -> List[Tuple[int | None, Dict[str, np.ndarray] | None]]:
+def _process_chunk_worker(
+    args: Tuple[str, str, str, str, Tuple[int, ...], int, str, int, int],
+) -> List[Tuple[int | None, Dict[str, np.ndarray] | None]]:
     """Picklable top-level worker for process_map.
 
     Args:
@@ -251,52 +574,83 @@ def _process_chunk_worker(args: Tuple[str, str, str, str, Tuple[int, ...], int, 
     Returns:
       List of (bucket_size, sample_dict) pairs (may include (None, None)).
     """
-    dataset_path, split, cache_dir, model_id, boundaries, max_length, instruction, start, end = args
-    proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    ds_local = load_dataset(dataset_path, split=split, cache_dir=cache_dir).with_format("python")
+    (
+        dataset_path,
+        split,
+        cache_dir,
+        model_id,
+        boundaries,
+        max_length,
+        instruction,
+        start,
+        end,
+    ) = args
+    # Load processor and dataset inside the worker. Any network failures are
+    # converted into empty outputs so exceptions do not cross process
+    # boundaries (some exceptions like httpx.RequestError are not picklable
+    # across processes on certain versions and can crash the pool).
+    try:
+        proc = _get_cached_processor(model_id)
+        ds_local = _load_dataset_with_retry(
+            dataset_path, split=split, cache_dir=cache_dir
+        ).with_format("python")
+    except Exception as exc:
+        logger.warning("Worker failed to init processor/dataset after retries: %s", exc)
+        # Return an empty result for this chunk; the caller will just skip it.
+        return []
     pad_token_id = proc.tokenizer.pad_token_id
     image_token_ids = _collect_image_token_ids(proc, pad_token_id)
     out: List[Tuple[int | None, Dict[str, np.ndarray] | None]] = []
     for idx in range(start, end):
-        ex = ds_local[idx]
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": instruction},
-                    {"type": "image", "image": ex["image"]},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": ex["text"]}],
-            },
-        ]
-        rendered_prompt = proc.apply_chat_template(
-            conversation, add_generation_prompt=False, tokenize=False
-        )
-        encoded = proc(
-            text=[rendered_prompt],
-            images=[ex["image"].convert("RGB")],
-            return_tensors="np",
-            padding=False,
-            max_length=max_length,
-            truncation=True,
-        )
-        input_ids = encoded["input_ids"][0].astype(np.int32)
-        bucket_size = next((b for b in boundaries if len(input_ids) <= b), None)
-        if bucket_size is None:
+        try:
+            ex = ds_local[idx]
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction},
+                        {"type": "image", "image": ex["image"]},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": ex["text"]}],
+                },
+            ]
+            rendered_prompt = proc.apply_chat_template(
+                conversation, add_generation_prompt=False, tokenize=False
+            )
+            encoded = proc(
+                text=[rendered_prompt],
+                images=[ex["image"].convert("RGB")],
+                return_tensors="np",
+                padding=False,
+                max_length=max_length,
+                truncation=True,
+            )
+            input_ids = encoded["input_ids"][0].astype(np.int32)
+            bucket_size = next((b for b in boundaries if len(input_ids) <= b), None)
+            if bucket_size is None:
+                out.append((None, None))
+                continue
+            padded_input = np.full((bucket_size,), pad_token_id, dtype=np.int32)
+            padded_input[: len(input_ids)] = input_ids
+            labels = padded_input.copy()
+            if image_token_ids:
+                labels[np.isin(labels, list(image_token_ids))] = -100
+            labels[labels == pad_token_id] = -100
+            targets = labels[:, None]
+            loss_mask = (targets != -100).astype(np.int32)
+            out.append(
+                (
+                    bucket_size,
+                    {"input": padded_input, "target": targets, "loss_mask": loss_mask},
+                )
+            )
+        except Exception:
+            # Skip examples that trigger transient network/decoding issues
+            # (e.g., httpx.RequestError when fetching remote assets).
             out.append((None, None))
-            continue
-        padded_input = np.full((bucket_size,), pad_token_id, dtype=np.int32)
-        padded_input[: len(input_ids)] = input_ids
-        labels = padded_input.copy()
-        if image_token_ids:
-            labels[np.isin(labels, list(image_token_ids))] = -100
-        labels[labels == pad_token_id] = -100
-        targets = labels[:, None]
-        loss_mask = (targets != -100).astype(np.int32)
-        out.append((bucket_size, {"input": padded_input, "target": targets, "loss_mask": loss_mask}))
     return out
 
 
@@ -306,12 +660,22 @@ def _prepare_bucketed_samples(
     processor: AutoProcessor,
     seed: int,
     max_length: int = max(BUCKET_BOUNDARIES),
+    proc_id: str,
 ) -> Tuple[Dict[int, List[Dict[str, np.ndarray]]], Dict[str, Any]]:
-    dataset = load_dataset(
-        DATASET_PATH,
-        split=split,
-        cache_dir=DATA_CACHE_DIR,
-    )
+    try:
+        dataset = _load_dataset_with_retry(
+            DATASET_PATH,
+            split=split,
+            cache_dir=DATA_CACHE_DIR,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Top-level dataset load failed after retries for %s: %s", split, exc
+        )
+        # Empty dataset: downstream logic will handle and report usable=0
+        from datasets import Dataset
+
+        dataset = Dataset.from_dict({"image": [], "text": []})
     dataset = dataset.with_format("python")
 
     pad_token_id = processor.tokenizer.pad_token_id
@@ -324,7 +688,7 @@ def _prepare_bucketed_samples(
     total_examples = len(dataset)
     max_workers = CPU_COUNT
 
-    print(
+    logger.info(
         f"  [{split}] preprocessing {total_examples} examples "
         f"with {max_workers} workers..."
     )
@@ -332,52 +696,58 @@ def _prepare_bucketed_samples(
     def _process_single(
         example: Dict[str, Any],
     ) -> Tuple[int | None, Dict[str, np.ndarray] | None]:
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": INSTRUCTION},
-                    {"type": "image", "image": example["image"]},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": example["text"]}],
-            },
-        ]
+        try:
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": INSTRUCTION},
+                        {"type": "image", "image": example["image"]},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": example["text"]}],
+                },
+            ]
 
-        rendered_prompt = processor.apply_chat_template(
-            conversation, add_generation_prompt=False, tokenize=False
-        )
-        encoded = processor(
-            text=[rendered_prompt],
-            images=[example["image"].convert("RGB")],
-            return_tensors="np",
-            padding=False,
-            max_length=max_length,
-            truncation=True,
-        )
-        input_ids = encoded["input_ids"][0].astype(np.int32)
-        bucket_size = next((b for b in BUCKET_BOUNDARIES if len(input_ids) <= b), None)
-        if bucket_size is None:
+            rendered_prompt = processor.apply_chat_template(
+                conversation, add_generation_prompt=False, tokenize=False
+            )
+            encoded = processor(
+                text=[rendered_prompt],
+                images=[example["image"].convert("RGB")],
+                return_tensors="np",
+                padding=False,
+                max_length=max_length,
+                truncation=True,
+            )
+            input_ids = encoded["input_ids"][0].astype(np.int32)
+            bucket_size = next(
+                (b for b in BUCKET_BOUNDARIES if len(input_ids) <= b), None
+            )
+            if bucket_size is None:
+                return None, None
+
+            padded_input = np.full((bucket_size,), pad_token_id, dtype=np.int32)
+            padded_input[: len(input_ids)] = input_ids
+
+            labels = padded_input.copy()
+            if image_token_ids:
+                labels[np.isin(labels, list(image_token_ids))] = -100
+            labels[labels == pad_token_id] = -100
+
+            targets = labels[:, None]
+            loss_mask = (targets != -100).astype(np.int32)
+
+            return bucket_size, {
+                "input": padded_input,
+                "target": targets,
+                "loss_mask": loss_mask,
+            }
+        except Exception:
+            # Skip examples that trigger transient network/decoding issues.
             return None, None
-
-        padded_input = np.full((bucket_size,), pad_token_id, dtype=np.int32)
-        padded_input[: len(input_ids)] = input_ids
-
-        labels = padded_input.copy()
-        if image_token_ids:
-            labels[np.isin(labels, list(image_token_ids))] = -100
-        labels[labels == pad_token_id] = -100
-
-        targets = labels[:, None]
-        loss_mask = (targets != -100).astype(np.int32)
-
-        return bucket_size, {
-            "input": padded_input,
-            "target": targets,
-            "loss_mask": loss_mask,
-        }
 
     # Prefer process-based parallelism for heavier CPU work if available.
     if process_map is not None and max_workers > 1:
@@ -390,16 +760,44 @@ def _prepare_bucketed_samples(
             chunks.append((s, e))
             s = e
         task_args = [
-            (DATASET_PATH, split, DATA_CACHE_DIR, MODEL_ID, BUCKET_BOUNDARIES, max_length, INSTRUCTION, st, ed)
+            (
+                DATASET_PATH,
+                split,
+                DATA_CACHE_DIR,
+                proc_id,
+                BUCKET_BOUNDARIES,
+                max_length,
+                INSTRUCTION,
+                st,
+                ed,
+            )
             for (st, ed) in chunks
         ]
-        for res in process_map(_process_chunk_worker, task_args, max_workers=workers, desc=f"[{split}] chunks", unit="chunk"):
-            for bucket_size, sample in res:
-                if bucket_size is None or sample is None:
-                    dropped_long += 1
-                    continue
-                bucket_samples[bucket_size].append(sample)
-    else:
+        try:
+            for res in process_map(
+                _process_chunk_worker,
+                task_args,
+                max_workers=workers,
+                desc=f"[{split}] chunks",
+                unit="chunk",
+            ):
+                for bucket_size, sample in res:
+                    if bucket_size is None or sample is None:
+                        dropped_long += 1
+                        continue
+                    bucket_samples[bucket_size].append(sample)
+        except Exception as exc:
+            logger.warning(
+                "[%s] process-based preprocessing failed (%s). Falling back to threads.",
+                split,
+                exc,
+            )
+            # Clear any partial results; we'll rebuild below using threads.
+            bucket_samples = {boundary: [] for boundary in BUCKET_BOUNDARIES}
+            dropped_long = 0
+            # Fall through to threaded path
+            pass
+    if not any(bucket_samples.values()):
         # Threaded fallback with smooth progress
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_process_single, ex) for ex in dataset]
@@ -471,7 +869,9 @@ def _compute_dynamic_batch_size(
         fallback = max(bucket_counts.values(), default=1)
         return max(1, min(max_dynamic_batch, fallback))
 
-    candidates = list(range(BASE_BATCH_SIZE, max_dynamic_batch + BASE_BATCH_SIZE, BASE_BATCH_SIZE))
+    candidates = list(
+        range(BASE_BATCH_SIZE, max_dynamic_batch + BASE_BATCH_SIZE, BASE_BATCH_SIZE)
+    )
     candidates = [c for c in candidates if c <= max_dynamic_batch]
     if not candidates:
         candidates = [max_dynamic_batch]
@@ -545,7 +945,8 @@ def _make_worst_case_batch(
 
 def _batch_to_elem_spec(batch: Dict[str, np.ndarray]) -> Dict[str, enp.ArraySpec]:
     return {
-        key: enp.ArraySpec(shape=value.shape, dtype=value.dtype) for key, value in batch.items()
+        key: enp.ArraySpec(shape=value.shape, dtype=value.dtype)
+        for key, value in batch.items()
     }
 
 
@@ -602,7 +1003,7 @@ def _maybe_download_image(url: Optional[str]) -> Optional[np.ndarray]:
         image = Image.open(io.BytesIO(response.content)).convert("RGB")
         return np.array(image, dtype=np.uint8)
     except Exception as exc:
-        print(f"Sample image fetch failed ({exc}); continuing without image.")
+        logger.warning("Sample image fetch failed (%s); continuing without image.", exc)
         return None
 
 
@@ -643,7 +1044,6 @@ def _maybe_init_wandb(args: argparse.Namespace, run_dir: Path) -> Optional[Wandb
         "train_split": args.train_split,
         "eval_split": args.eval_split,
         "log_tpu_memory": args.log_tpu_memory,
-        
     }
     run = wandb.init(
         project=args.wandb_project,
@@ -673,13 +1073,13 @@ def _log_metrics(
     metric_values = _tree_to_floats(getattr(aux_output, "metric_values", None))
 
     if loss_values:
-        print(f"{label} losses:")
+        logger.info("%s losses:", label)
         for key, value in sorted(loss_values.items()):
-            print(f"  {key}: {value:.6f}")
+            logger.info("  %s: %.6f", key, value)
     if metric_values:
-        print(f"{label} metrics:")
+        logger.info("%s metrics:", label)
         for key, value in sorted(metric_values.items()):
-            print(f"  {key}: {value:.6f}")
+            logger.info("  %s: %.6f", key, value)
 
     record = {
         "label": label,
@@ -707,12 +1107,12 @@ def _run_evaluator(
 ) -> None:
     evaluator = trainer.evals.get("eval")
     if evaluator is None:
-        print(f"{label}: evaluator not configured, skipping.")
+        logger.info("%s: evaluator not configured, skipping.", label)
         return
-    print(f"\nRunning {label} evaluation...")
+    logger.info("Running %s evaluation...", label)
     aux_state = evaluator.evaluate(state=state, step=int(state.step))
     if aux_state is None:
-        print(f"{label}: evaluator returned no metrics.")
+        logger.info("%s: evaluator returned no metrics.", label)
         return
     aux_output = aux_state.compute(flatten=False)
     _log_metrics(
@@ -744,18 +1144,18 @@ def _run_chat_sample(
     kwargs = {}
     if image is not None:
         kwargs["images"] = [image]
-    print(f"\nRunning {label} chat sample...")
+    logger.info("Running %s chat sample...", label)
     response = sampler.chat(prompt, **kwargs)
-    print(f"Prompt: {prompt}")
+    logger.info("Prompt: %s", prompt)
     if image is not None:
-        print("Image input provided.")
-    print(f"Response ({label}): {response}")
+        logger.info("Image input provided.")
+    logger.info("Response (%s): %s", label, response)
 
     object.__setattr__(sampler, "last_state", None)
     sampler.turns.clear()
     try:
         jax.clear_caches()
-        print("Cleared JAX compilation cache.")
+        logger.info("Cleared JAX compilation cache.")
     except AttributeError:
         pass
 
@@ -767,10 +1167,12 @@ def _run_chat_sample(
     if jsonl_path is not None:
         _append_metrics_record(jsonl_path, record)
     if wandb_handle is not None:
-        wandb_handle.run.log({
-            f"chat/{label}/prompt": prompt,
-            f"chat/{label}/response": response,
-        })
+        wandb_handle.run.log(
+            {
+                f"chat/{label}/prompt": prompt,
+                f"chat/{label}/response": response,
+            }
+        )
 
     chat_path = run_dir / f"{label}_chat.txt"
     with chat_path.open("w", encoding="utf-8") as fh:
@@ -799,20 +1201,22 @@ def _maybe_log_tpu_memory(*, log_memory: bool) -> None:
             mem_free, mem_total = sub
             mem_used = max(0, mem_total - mem_free)
         else:
-            print("Failed to query TPU memory via tpu_info.")
+            logger.info("Failed to query TPU memory via tpu_info.")
             return
 
     if mem_total:
-        print(
-            f"TPU memory (per-replica): used={mem_used / 1e9:.2f} GB, "
-            f"free={mem_free / 1e9:.2f} GB, total={mem_total / 1e9:.2f} GB"
+        logger.info(
+            "TPU memory (per-replica): used=%.2f GB free=%.2f GB total=%.2f GB",
+            mem_used / 1e9,
+            mem_free / 1e9,
+            mem_total / 1e9,
         )
 
 
 def _log_tpu_memory_event(*, enabled: bool, label: str) -> None:
     if not enabled:
         return
-    print(f"[mem] {label}:")
+    logger.info("[mem] %s:", label)
     _maybe_log_tpu_memory(log_memory=True)
 
 
@@ -824,7 +1228,7 @@ def _log_tpu_memory_event(*, enabled: bool, label: str) -> None:
 def _tpu_memory_free_and_total() -> Optional[Tuple[int, int]]:
     """Return (free_bytes, total_bytes) per replica if available.
 
-    Uses tpu_info when available and falls back to torch_xla. Returns None if no
+    Uses tpu_info when available. Returns None if no
     provider can be used in the current environment.
     """
     # Only attempt on TPU backends.
@@ -902,7 +1306,9 @@ def _tpuinfo_cli_query(*, spmd: bool) -> Optional[Tuple[int, int]]:
             return None
         txt = proc.stdout
         # Find lines like "0.00 GiB / 31.75 GiB"; collect per-chip totals/used.
-        gib_line = re.findall(r"([0-9]+\.[0-9]+)\s*GiB\s*/\s*([0-9]+\.[0-9]+)\s*GiB", txt)
+        gib_line = re.findall(
+            r"([0-9]+\.[0-9]+)\s*GiB\s*/\s*([0-9]+\.[0-9]+)\s*GiB", txt
+        )
         totals = []
         useds = []
         for used_gib, total_gib in gib_line:
@@ -933,7 +1339,7 @@ def _tpu_info_query_subprocess() -> Optional[Tuple[int, int]]:
     import subprocess, textwrap, json as _json
 
     code = textwrap.dedent(
-        r'''
+        r"""
 import json
 try:
   from tpu_info import device as tpu_device
@@ -947,11 +1353,12 @@ try:
     raise SystemExit(3)
   free = min(t - u for (t, u) in per_chip)
   total = min(t for (t, _u) in per_chip)
-  print(json.dumps({'free': free, 'total': total}))
+  logger.info(json.dumps({'free': free, 'total': total}))
   raise SystemExit(0)
 except Exception:
   raise SystemExit(1)
-''')
+"""
+    )
     try:
         proc = subprocess.run(
             ["python", "-c", code],
@@ -986,7 +1393,7 @@ def _estimate_upper_batch_from_tpu_memory(
 
     Strategy:
     - Validate once at BASE_BATCH_SIZE to ensure program compiles and runs.
-    - Read free memory (per replica) via tpu_info/torch_xla.
+    - Read free memory (per replica) via tpu_info.
     - Approximate per-sample memory as reserved_at_base / BASE_BATCH_SIZE.
       This is conservative (includes fixed overhead) but avoids OOM.
     - Predict upper bound and verify with validator; if it fails, binary search
@@ -996,28 +1403,36 @@ def _estimate_upper_batch_from_tpu_memory(
     mem = _tpu_memory_free_and_total()
     if mem is None:
         if verbose:
-            print("[batch-tuning] No TPU memory provider available; using OOM-guided search only.")
+            logger.info(
+                "[batch-tuning] No TPU memory provider available; using OOM-guided search only."
+            )
         return None
     if verbose:
-        print(f"[batch-tuning] Pre-step memory: free={mem[0]} bytes, total={mem[1]} bytes")
+        logger.info(
+            f"[batch-tuning] Pre-step memory: free={mem[0]} bytes, total={mem[1]} bytes"
+        )
 
     # First, validate at BASE_BATCH_SIZE and measure reserved after the step.
     # We obtain reserved by re-querying total-free.
     if verbose:
-        print(f"[batch-tuning] Validating BASE_BATCH_SIZE={BASE_BATCH_SIZE}...")
+        logger.info(f"[batch-tuning] Validating BASE_BATCH_SIZE={BASE_BATCH_SIZE}...")
     if not validator(BASE_BATCH_SIZE):  # pragma: no cover - guarded by validator
         if verbose:
-            print("[batch-tuning] Failed at BASE_BATCH_SIZE; aborting memory-based cap.")
+            logger.info(
+                "[batch-tuning] Failed at BASE_BATCH_SIZE; aborting memory-based cap."
+            )
         return None
     post_mem = _tpu_memory_free_and_total()
     if post_mem is None:
         if verbose:
-            print("[batch-tuning] Post-step memory read failed; aborting memory-based cap.")
+            logger.info(
+                "[batch-tuning] Post-step memory read failed; aborting memory-based cap."
+            )
         return None
     free_bytes, total_bytes = post_mem
     reserved_bytes = max(0, total_bytes - free_bytes)
     if verbose:
-        print(
+        logger.info(
             f"[batch-tuning] Post-step memory: free={free_bytes}, total={total_bytes}; "
             f"reserved≈{reserved_bytes}"
         )
@@ -1025,14 +1440,14 @@ def _estimate_upper_batch_from_tpu_memory(
     # Conservative per-sample estimate.
     per_sample = max(1, reserved_bytes // BASE_BATCH_SIZE)
     if verbose:
-        print(f"[batch-tuning] Estimated per-sample bytes: {per_sample}")
+        logger.info(f"[batch-tuning] Estimated per-sample bytes: {per_sample}")
 
     # Leave a safety margin: 5% of total or 1 GiB, whichever is larger.
     safety = max(int(total_bytes * 0.05), 1 << 30)
     headroom = max(0, free_bytes - safety)
     if headroom <= 0:
         if verbose:
-            print(
+            logger.info(
                 f"[batch-tuning] No headroom after safety margin (safety={safety}); "
                 f"returning BASE_BATCH_SIZE={BASE_BATCH_SIZE}"
             )
@@ -1042,12 +1457,12 @@ def _estimate_upper_batch_from_tpu_memory(
     # Round to multiple of BASE_BATCH_SIZE.
     if predicted <= 0:
         if verbose:
-            print("[batch-tuning] Predicted cap <= 0; returning BASE_BATCH_SIZE.")
+            logger.info("[batch-tuning] Predicted cap <= 0; returning BASE_BATCH_SIZE.")
         return BASE_BATCH_SIZE
     predicted = (predicted // BASE_BATCH_SIZE) * BASE_BATCH_SIZE
     predicted = max(BASE_BATCH_SIZE, min(predicted, max_dynamic_batch))
     if verbose:
-        print(
+        logger.info(
             f"[batch-tuning] Safety={safety}, headroom={headroom}; predicted cap={predicted}; "
             f"flag max={max_dynamic_batch}"
         )
@@ -1059,16 +1474,16 @@ def _estimate_upper_batch_from_tpu_memory(
         mid = ((lo + hi) // (2 * BASE_BATCH_SIZE)) * BASE_BATCH_SIZE
         mid = max(BASE_BATCH_SIZE, mid)
         if verbose:
-            print(f"[batch-tuning] Try mid={mid} ...", end="")
+            logger.info(f"[batch-tuning] Try mid={mid} ...", end="")
         if validator(mid):
             best = mid
             lo = mid + BASE_BATCH_SIZE
             if verbose:
-                print("OK")
+                logger.info("OK")
         else:
             hi = mid - BASE_BATCH_SIZE
             if verbose:
-                print("OOM/NO")
+                logger.info("OOM/NO")
     return best
 
 
@@ -1084,79 +1499,107 @@ def main() -> None:
     os.environ["JAX_PLATFORM_NAME"] = args.jax_platform
     jax.config.update("jax_platform_name", args.jax_platform)
 
+    print("=== Kauldron Fine-tuning Setup ===")
+
     # Using tpu-info CLI; no external python interpreter needed.
 
-    print("=== Gemma Kauldron Fine-tuning Setup ===")
+    logger.info("=== Kauldron Fine-tuning Setup ===")
 
-    print("\n1. Initializing tokenizer...")
-    tokenizer = hfax.text.Gemma3Tokenizer()
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    print("✓ Tokenizer initialized.")
+    logger.info("1. Initializing tokenizer and processor...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+    proc_id = GEMMA_MODEL_ID if args.processor_id is None else args.processor_id
+    logger.info("[Gemma] Ensuring local processor snapshot id=%s", proc_id)
+    proc_local = _ensure_local_repo(proc_id, repo_type="model")
+    processor = AutoProcessor.from_pretrained(
+        str(proc_local), trust_remote_code=True, local_files_only=True
+    )
+    logger.info("✓ Tokenizer and processor initialized.")
 
     # Normalize fixed-batch alias
-    if getattr(args, 'fixed_batch_size', None) is not None and args.force_batch_size is None:
+    if (
+        getattr(args, "fixed_batch_size", None) is not None
+        and args.force_batch_size is None
+    ):
         args.force_batch_size = int(args.fixed_batch_size)
 
     # Optionally override bucket boundaries or switch to fixed-max mode
     global BUCKET_BOUNDARIES
     if args.fixed_max_length is not None:
         BUCKET_BOUNDARIES = (int(args.fixed_max_length),)
-        print(f"[config] Fixed max length enabled: {BUCKET_BOUNDARIES[0]} tokens.")
+        logger.info(
+            "[config] Fixed max length enabled: %d tokens.", BUCKET_BOUNDARIES[0]
+        )
     elif args.bucket_boundaries:
         try:
-            BUCKET_BOUNDARIES = tuple(int(x.strip()) for x in args.bucket_boundaries.split(",") if x.strip())
+            BUCKET_BOUNDARIES = tuple(
+                int(x.strip()) for x in args.bucket_boundaries.split(",") if x.strip()
+            )
             if not BUCKET_BOUNDARIES:
                 raise ValueError
         except Exception:
-            raise ValueError("--bucket-boundaries must be a comma-separated list of ints, e.g. '512' or '512,1024'")
+            raise ValueError(
+                "--bucket-boundaries must be a comma-separated list of ints, e.g. '512' or '512,1024'"
+            )
 
-    print("\n2. Preprocessing and bucketing dataset...")
+    logger.info("2. Preprocessing and bucketing dataset...")
     train_bucket_samples, train_stats = _prepare_bucketed_samples(
         split=args.train_split,
         processor=processor,
         seed=RNG_SEED,
         max_length=max(BUCKET_BOUNDARIES),
+        proc_id=proc_id,
     )
     eval_bucket_samples, eval_stats = _prepare_bucketed_samples(
         split=args.eval_split,
         processor=processor,
         seed=RNG_SEED + 1,
         max_length=max(BUCKET_BOUNDARIES),
+        proc_id=proc_id,
     )
 
-    print(
-        "Train bucket counts:",
+    logger.info(
+        "Train bucket counts: %s",
         {k: v for k, v in train_stats["bucket_counts"].items() if v},
     )
-    print(
-        "Eval bucket counts:",
+    logger.info(
+        "Eval bucket counts: %s",
         {k: v for k, v in eval_stats["bucket_counts"].items() if v},
     )
-    print(
-        f"Dropped {train_stats['dropped_long']} long examples (train)"
-        f" and {eval_stats['dropped_long']} (eval)."
+    logger.info(
+        "Dropped %d long examples (train) and %d (eval).",
+        train_stats["dropped_long"],
+        eval_stats["dropped_long"],
     )
-    print(
-        f"  Training data workers: {TRAIN_NUM_WORKERS},"
-        f" eval data workers: {EVAL_NUM_WORKERS}"
+    logger.info(
+        "Training data workers: %d eval data workers: %d",
+        TRAIN_NUM_WORKERS,
+        EVAL_NUM_WORKERS,
     )
 
-    print("\n3. Defining Gemma 3 4B model...")
-    model = hfax.nn.Gemma3_4B(tokens="batch.input")
-    print("✓ Model defined.")
+    logger.info(f"3. Defining {args.model_id} model (baseline HF placeholder)...")
+    # default: Load the model on the available device(s)
+    logger.info(
+        "[Gemma] Loading placeholder HF model id=%s device_map=auto torch_dtype=auto",
+        args.model_id,
+    )
+    logger.info("✓ Model defined.")
 
-    print("\n4. Defining loss function (SoftmaxCrossEntropy)...")
+    logger.info("4. Defining loss function (SoftmaxCrossEntropy)...")
     loss = kd.losses.SoftmaxCrossEntropyWithIntLabels(
         logits="preds.logits",
         labels="batch.target",
         mask="batch.loss_mask",
     )
-    print("✓ Loss function defined.")
+    logger.info("✓ Loss function defined.")
 
     validation_optimizer = optax.adafactor(learning_rate=1e-3)
     # Provide rng_streams to avoid unresolved ROOT_CFG_REF during init.
     rng_streams = kd.train.RngStreams(
-        [kd.train.RngStream(name="dropout", init=True, train=True, eval=False, per_step=True)],
+        [
+            kd.train.RngStream(
+                name="dropout", init=True, train=True, eval=False, per_step=True
+            )
+        ],
         seed=RNG_SEED,
     )
     validation_trainstep = kd.train.train_step.TrainStep(
@@ -1169,7 +1612,9 @@ def main() -> None:
     )
 
     if args.skip_oom_validator:
-        print("[batch-tuning] Skipping JAX-based OOM validator per --skip-oom-validator.")
+        logger.info(
+            "[batch-tuning] Skipping JAX-based OOM validator per --skip-oom-validator."
+        )
         train_validator = None
         eval_validator = None
     else:
@@ -1185,28 +1630,40 @@ def main() -> None:
     upper_hint: Optional[int] = None
     if args.force_batch_size is not None:
         train_batch_size = eval_batch_size = max(1, int(args.force_batch_size))
-        print(f"[batch-tuning] Forcing batch size to {train_batch_size} via --force-batch-size.")
+        logger.info(
+            "[batch-tuning] Forcing batch size to %d via --force-batch-size.",
+            train_batch_size,
+        )
     else:
         # If allowed, estimate an upper bound from live TPU memory and cap search.
         if args.no_live_memory_query:
-            print("[batch-tuning] Live memory queries disabled (--no-live-memory-query).")
+            logger.info(
+                "[batch-tuning] Live memory queries disabled (--no-live-memory-query)."
+            )
             upper_hint = None
         else:
             upper_hint = _estimate_upper_batch_from_tpu_memory(
                 bucket_samples=train_bucket_samples,
-                validator=(train_validator if train_validator is not None else (lambda _: True)),
+                validator=(
+                    train_validator if train_validator is not None else (lambda _: True)
+                ),
                 max_dynamic_batch=args.max_dynamic_batch,
                 verbose=(args.log_batch_tuning or args.log_tpu_memory),
             )
         # Use memory-derived upper bound whenever available (validator optional)
         if upper_hint is not None:
-            print(f"Using TPU memory-derived upper batch bound: {upper_hint}")
+            logger.info("Using TPU memory-derived upper batch bound: %d", upper_hint)
             train_max = min(args.max_dynamic_batch, upper_hint)
         else:
             if args.skip_oom_validator:
                 # Be conservative when validator is off.
-                train_max = min(args.max_dynamic_batch, max(BASE_BATCH_SIZE, BASE_BATCH_SIZE * 2))
-                print(f"[batch-tuning] Validator disabled; capping train max to {train_max}.")
+                train_max = min(
+                    args.max_dynamic_batch, max(BASE_BATCH_SIZE, BASE_BATCH_SIZE * 2)
+                )
+                logger.info(
+                    "[batch-tuning] Validator disabled; capping train max to %d.",
+                    train_max,
+                )
             else:
                 train_max = args.max_dynamic_batch
 
@@ -1220,7 +1677,9 @@ def main() -> None:
         if args.skip_oom_validator:
             eval_upper = min(args.max_dynamic_batch, train_max)
         else:
-            eval_upper = upper_hint if upper_hint is not None else args.max_dynamic_batch
+            eval_upper = (
+                upper_hint if upper_hint is not None else args.max_dynamic_batch
+            )
         eval_batch_size = _compute_dynamic_batch_size(
             eval_stats["bucket_counts"],
             max_dynamic_batch=eval_upper,
@@ -1268,21 +1727,25 @@ def main() -> None:
         }
     )
 
-    print("Train utilized per bucket:", {k: v for k, v in train_utilized.items() if v})
+    logger.info(
+        "Train utilized per bucket:", {k: v for k, v in train_utilized.items() if v}
+    )
     if any(train_dropped.values()):
-        print(
+        logger.info(
             "Train dropped due to batching:",
             {k: v for k, v in train_dropped.items() if v},
         )
-    print(f"Train usable examples (batched): {train_stats['usable_examples']}")
+    logger.info(f"Train usable examples (batched): {train_stats['usable_examples']}")
 
-    print("Eval utilized per bucket:", {k: v for k, v in eval_utilized.items() if v})
+    logger.info(
+        "Eval utilized per bucket:", {k: v for k, v in eval_utilized.items() if v}
+    )
     if any(eval_dropped.values()):
-        print(
+        logger.info(
             "Eval dropped due to batching:",
             {k: v for k, v in eval_dropped.items() if v},
         )
-    print(f"Eval usable examples (batched): {eval_stats['usable_examples']}")
+    logger.info(f"Eval usable examples (batched): {eval_stats['usable_examples']}")
 
     target_tokens = train_stats["batch_size"] * max(BUCKET_BOUNDARIES)
     train_tokens_total = sum(
@@ -1291,14 +1754,14 @@ def main() -> None:
     eval_tokens_total = sum(
         boundary * count for boundary, count in eval_utilized.items()
     )
-    print(
+    logger.info(
         f"Computed train batch size: {train_batch_size} (~{target_tokens} tokens target)"
     )
-    print(f"Computed eval batch size: {eval_batch_size}")
-    print(
+    logger.info(f"Computed eval batch size: {eval_batch_size}")
+    logger.info(
         f"Approx train tokens/step: {train_tokens_total / max(1, len(train_batched_samples)):.0f}"
     )
-    print(
+    logger.info(
         f"Approx eval tokens/step: {eval_tokens_total / max(1, len(eval_batched_samples)):.0f}"
     )
 
@@ -1316,18 +1779,18 @@ def main() -> None:
             "Mismatch between dataset batches and expected batches: "
             f"len(ds)={available_batches} vs expected={expected_per_epoch * args.train_epochs}"
         )
-    print(
+    logger.info(
         "len(ds):",
         available_batches,
         "batches across",
         args.train_epochs,
         "epochs",
     )
-    print(
+    logger.info(
         f"Planned training steps: {available_batches}"
         f" ({expected_per_epoch} batches per epoch)"
     )
-    print("✓ Data pipeline created.")
+    logger.info("✓ Data pipeline created.")
 
     eval_ds = kd.data.py.DataSource(
         data_source=PrecomputedSampleDataSource(eval_batched_samples),
@@ -1340,7 +1803,7 @@ def main() -> None:
     CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
     run_dir = CHECKPOINT_ROOT / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    print(f"Checkpoint run directory: {run_dir}")
+    logger.info(f"Checkpoint run directory: {run_dir}")
 
     metrics_jsonl_path = (
         Path(args.metrics_jsonl) if args.metrics_jsonl else run_dir / "metrics.jsonl"
@@ -1350,7 +1813,7 @@ def main() -> None:
     if not args.skip_chat_samples:
         sample_image = _maybe_download_image(args.sample_image_url)
 
-    print("\n5. Configuring the Kauldron trainer...")
+    logger.info("\n5. Configuring the Kauldron trainer...")
     trainer = kd.train.Trainer(
         seed=RNG_SEED,
         workdir=str(run_dir),
@@ -1370,13 +1833,15 @@ def main() -> None:
         train_losses={"loss": loss},
         optimizer=optax.adafactor(learning_rate=1e-3),
     )
-    print("✓ Trainer configured.")
+    logger.info("✓ Trainer configured.")
 
     # Pre-training detailed memory log
     _log_tpu_memory_event(
-        enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+        enabled=(
+            not args.no_live_memory_query
+            and (args.log_tpu_memory or args.log_batch_tuning)
+        ),
         label="pre_training",
-        
     )
 
     pre_state = None
@@ -1384,9 +1849,11 @@ def main() -> None:
         pre_state = trainer.init_state()
         if not args.skip_pre_eval:
             _log_tpu_memory_event(
-                enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+                enabled=(
+                    not args.no_live_memory_query
+                    and (args.log_tpu_memory or args.log_batch_tuning)
+                ),
                 label="pre_training_eval/pre",
-                
             )
             _run_evaluator(
                 trainer=trainer,
@@ -1396,15 +1863,19 @@ def main() -> None:
                 wandb_handle=wandb_handle,
             )
             _log_tpu_memory_event(
-                enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+                enabled=(
+                    not args.no_live_memory_query
+                    and (args.log_tpu_memory or args.log_batch_tuning)
+                ),
                 label="pre_training_eval/post",
-                
             )
         if sample_image is not None:
             _log_tpu_memory_event(
-                enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+                enabled=(
+                    not args.no_live_memory_query
+                    and (args.log_tpu_memory or args.log_batch_tuning)
+                ),
                 label="chat_sample/pre_training/pre",
-                
             )
             _run_chat_sample(
                 label="pre_training",
@@ -1418,47 +1889,58 @@ def main() -> None:
                 run_dir=run_dir,
             )
             _log_tpu_memory_event(
-                enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+                enabled=(
+                    not args.no_live_memory_query
+                    and (args.log_tpu_memory or args.log_batch_tuning)
+                ),
                 label="chat_sample/pre_training/post",
             )
 
-    print(f"\n6. Starting training for {len(train_ds)} steps...")
+    logger.info(f"\n6. Starting training for {len(train_ds)} steps...")
     state = None
     aux = None
     try:
         state, aux = trainer.train()
-        print("\n✓ Training finished.")
+        logger.info("\n✓ Training finished.")
     except StopIteration:
-        print("\nTraining iterator exhausted (StopIteration); treating as finished.")
+        logger.info(
+            "\nTraining iterator exhausted (StopIteration); treating as finished."
+        )
 
     # Post-training detailed memory log
     if state is not None:
         _log_tpu_memory_event(
-            enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+            enabled=(
+                not args.no_live_memory_query
+                and (args.log_tpu_memory or args.log_batch_tuning)
+            ),
             label="post_training",
-            
         )
 
     if aux is not None:
         try:
             aux_output = aux.compute(flatten=False)
         except AttributeError:
-            print("Training auxiliaries have no compute method; skipping logging.")
+            logger.info(
+                "Training auxiliaries have no compute method; skipping logging."
+            )
         else:
             _log_metrics(
                 label="training",
                 aux_output=aux_output,
                 jsonl_path=metrics_jsonl_path,
                 wandb_handle=wandb_handle,
-                step=int(getattr(state, 'step', 0) or 0),
+                step=int(getattr(state, "step", 0) or 0),
             )
 
-    print("\n7. Running evaluations and chat sampling...")
+    logger.info("\n7. Running evaluations and chat sampling...")
     if state is not None:
         _log_tpu_memory_event(
-            enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+            enabled=(
+                not args.no_live_memory_query
+                and (args.log_tpu_memory or args.log_batch_tuning)
+            ),
             label="post_training_eval/pre",
-            
         )
         _run_evaluator(
             trainer=trainer,
@@ -1468,9 +1950,11 @@ def main() -> None:
             wandb_handle=wandb_handle,
         )
         _log_tpu_memory_event(
-            enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
+            enabled=(
+                not args.no_live_memory_query
+                and (args.log_tpu_memory or args.log_batch_tuning)
+            ),
             label="post_training_eval/post",
-            
         )
 
     if sample_image is not None:
@@ -1487,9 +1971,11 @@ def main() -> None:
         )
 
     elapsed_seconds = time.time() - start_time
-    print(
-        "Total run time: "
-        f"{int(elapsed_seconds // 3600):02d}:{int((elapsed_seconds % 3600) // 60):02d}:{int(elapsed_seconds % 60):02d}"
+    logger.info(
+        "Total run time: %02d:%02d:%02d",
+        int(elapsed_seconds // 3600),
+        int((elapsed_seconds % 3600) // 60),
+        int(elapsed_seconds % 60),
     )
     runtime_record = {"label": "runtime", "elapsed_seconds": elapsed_seconds}
     if metrics_jsonl_path is not None:
@@ -1498,7 +1984,7 @@ def main() -> None:
         wandb_handle.run.log({"runtime/elapsed_seconds": elapsed_seconds})
 
     _finish_wandb(wandb_handle)
-    print("\n✓ Evaluation complete.")
+    logger.info("\n✓ Evaluation complete.")
 
 
 if __name__ == "__main__":
