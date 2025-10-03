@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import pickle
 import re
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import jax
@@ -53,7 +55,7 @@ def build_trainstep() -> kd.train.train_step.TrainStep:
         model=model,
         optimizer=optax.adafactor(learning_rate=1e-3),
         rng_streams=rng_streams,
-        sharding=kd.train.train_step.sharding_lib.ShardingStrategy(),
+        sharding=kd.sharding.ShardingStrategy(params=kd.sharding.FSDPSharding()),
         init_transform=hfax.ckpts.LoadCheckpoint(
             path=hfax.ckpts.CheckpointPath.GEMMA3_4B_IT
         ),
@@ -71,10 +73,10 @@ def tile_sample(
 
 def measure_memory_from_bucket(
     trainstep: kd.train.train_step.TrainStep,
-    host_state,
+    state_entry,
     batch_size: int,
     sample: Dict[str, np.ndarray],
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+) -> Tuple[Dict[str, float], Tuple[object, object]]:
     # Ensure a clean slate to reflect memory for this batch only.
     try:
         jax.clear_caches()
@@ -87,10 +89,18 @@ def measure_memory_from_bucket(
     }
 
     mem_pre = per_replica_free_total()
+    host_state, shardings = state_entry or (None, None)
     if host_state is None:
         state_dev = trainstep.init(elem_spec=elem_spec)
         host_state = jax.device_get(state_dev)
-    state = jax.device_put(host_state)
+        shardings = jax.tree.map(lambda x: getattr(x, "sharding", None), state_dev)
+
+    def _put(val, sh):
+        if sh is not None:
+            return jax.device_put(val, sh)
+        return jax.device_put(val)
+
+    state = jax.tree.map(_put, host_state, shardings)
     mem_post_init = per_replica_free_total()
 
     arrs = tile_sample(sample, batch_size)
@@ -142,7 +152,10 @@ def measure_memory_from_bucket(
         jax.clear_caches()
     except Exception:
         pass
-    return res, host_state
+    # Update host snapshot to latest state for reuse
+    host_state = jax.device_get(state)
+    shardings = jax.tree.map(lambda x: getattr(x, "sharding", None), state)
+    return res, (host_state, shardings)
 
 
 def main():
@@ -203,16 +216,36 @@ def main():
             f"Limiting split from '{args.split}' to '{limited_split}' (max {args.max_batch} samples)"
         )
 
-    real_samples, stats = sg._prepare_bucketed_samples(
-        split=limited_split,
-        processor=processor,
-        seed=42,
-        max_length=max(sg.BUCKET_BOUNDARIES),
-        max_per_bucket=args.max_batch,
+    cache_dir = Path(sg.DATA_CACHE_DIR) / "batch_tuning_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = "__".join(
+        [
+            sg.MODEL_ID.replace("/", "__"),
+            limited_split.replace(":", "-"),
+            "tokens=" + "-".join(str(t) for t in token_sizes),
+            f"max={args.max_batch}",
+        ]
     )
-    bucket_samples: Dict[int, List[Dict[str, np.ndarray]]] = {
-        L: (real_samples.get(L, []) or []) for L in token_sizes
-    }
+    cache_path = cache_dir / f"{cache_key}.pkl"
+
+    if cache_path.exists():
+        if args.verbose:
+            print(f"Loading cached bucket samples from {cache_path}")
+        with cache_path.open("rb") as fh:
+            bucket_samples, stats = pickle.load(fh)
+    else:
+        real_samples, stats = sg._prepare_bucketed_samples(
+            split=limited_split,
+            processor=processor,
+            seed=42,
+            max_length=max(sg.BUCKET_BOUNDARIES),
+            max_per_bucket=args.max_batch,
+        )
+        bucket_samples = {L: (real_samples.get(L, []) or []) for L in token_sizes}
+        with cache_path.open("wb") as fh:
+            pickle.dump((bucket_samples, stats), fh)
+        if args.verbose:
+            print(f"Cached bucket samples to {cache_path}")
 
     tuner = BucketBatchTuner(
         base_batch_size=args.base_batch,
@@ -241,7 +274,7 @@ def main():
             f"  length={L}: best_batch={tune_res.best_per_bucket[L]} predicted={tune_res.predicted_caps.get(L)} per_sample≈{per_sample_gib:.2f} GiB"
         )
 
-    host_states: Dict[int, Any] = {}
+    host_states: Dict[int, Tuple[object, object]] = {}
 
     print("\nMeasuring memory at tuned batch sizes (per-replica):")
     for L in sorted(tune_res.best_per_bucket.keys()):
@@ -249,13 +282,13 @@ def main():
         if not bucket_samples.get(L):
             print(f"  length={L} no sample available; skipping")
             continue
-        stats, host_state = measure_memory_from_bucket(
+        stats, state_entry = measure_memory_from_bucket(
             trainstep,
             host_states.get(L),
             B,
             bucket_samples[L][0],
         )
-        host_states[L] = host_state
+        host_states[L] = state_entry
         print(
             f"  length={L} batch={B} -> used_after_step={stats['used_gib_after_step']:.2f} GiB / total={stats['total_gib']:.2f} GiB (Δ={stats['delta_gib_from_start']:.2f} GiB)"
         )
