@@ -34,6 +34,8 @@ from jax import errors as jax_errors
 from PIL import Image
 from grain import python as grain
 from transformers import AutoProcessor
+from hfax.utils.tpu_mem import log_tpu_memory, XLAMemoryTimer, per_replica_free_total
+from hfax.utils.logging import logger
 
 import hfax
 from kauldron import kd
@@ -98,6 +100,12 @@ def parse_args() -> argparse.Namespace:
         choices=["cpu", "tpu", "gpu"],
         default=os.environ.get("JAX_PLATFORM_NAME", "cpu"),
         help="Backend to target with JAX (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--mem-interval",
+        type=float,
+        default=0.0,
+        help="If > 0, monitor TPU memory in background at this interval (seconds).",
     )
     # No external python needed; we use torch_xla directly in py3.12.
     parser.add_argument(
@@ -782,38 +790,19 @@ def _run_chat_sample(
 # -----------------------------------------------------------------------------
 
 
-def _maybe_log_tpu_memory(*, log_memory: bool) -> None:
+def _maybe_log_tpu_memory(*, log_memory: bool, label: str = "event") -> None:
     if not log_memory:
         return
-
-    mem_total = mem_used = mem_free = 0
-
-    # Try external Python 3.10 helper first
-    ext = _tpuinfo_cli_query(spmd=True)
-    if ext is not None:
-        mem_free, mem_total = ext
-        mem_used = max(0, mem_total - mem_free)
-    else:
-        sub = _tpu_info_query_subprocess()
-        if sub is not None:
-            mem_free, mem_total = sub
-            mem_used = max(0, mem_total - mem_free)
-        else:
-            print("Failed to query TPU memory via tpu_info.")
-            return
-
-    if mem_total:
-        print(
-            f"TPU memory (per-replica): used={mem_used / 1e9:.2f} GB, "
-            f"free={mem_free / 1e9:.2f} GB, total={mem_total / 1e9:.2f} GB"
-        )
+    try:
+        log_tpu_memory(label)
+    except Exception as exc:
+        logger.warning("[mem] log failed: %s", exc)
 
 
 def _log_tpu_memory_event(*, enabled: bool, label: str) -> None:
     if not enabled:
         return
-    print(f"[mem] {label}:")
-    _maybe_log_tpu_memory(log_memory=True)
+    _maybe_log_tpu_memory(log_memory=True, label=label)
 
 
 # -----------------------------------------------------------------------------
@@ -835,144 +824,22 @@ def _tpu_memory_free_and_total() -> Optional[Tuple[int, int]]:
     except Exception:
         return None
 
-    # Prefer external Python 3.10 helper script first.
-    res = _tpuinfo_cli_query(spmd=True)
-    if res is not None:
-        return res
-
-    # Then try in-process tpu_info (subprocess Python 3.12 safe)
-    res = _tpu_info_query_subprocess()
-    if res is not None:
-        return res
-
-    return None
+    try:
+        return per_replica_free_total()
+    except Exception:
+        return None
 
 
 def _tpuinfo_cli_query(*, spmd: bool) -> Optional[Tuple[int, int]]:
-    """Query memory using the installed `tpu-info` CLI (Python 3.12 safe).
-
-    Tries JSON mode first (newer tpu-info), then falls back to parsing text.
-    Returns (free_bytes, total_bytes) per replica when spmd=True, else device totals.
-    """
-    import subprocess, json as _json, re
-
-    # Try JSON output (newer tpu-info versions support single-metric mode).
-    try:
-        proc = subprocess.run(
-            ["tpu-info", "--metric", "hbm_usage", "--format", "json"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-        if proc.returncode == 0 and proc.stdout.strip().startswith("{"):
-            data = _json.loads(proc.stdout)
-            # Expect structure with a list of chips each having total/used (bytes).
-            chips = data.get("chips") or data.get("devices") or []
-            totals = []
-            useds = []
-            for c in chips:
-                t = int(c.get("total_bytes") or c.get("total") or 0)
-                u = int(c.get("used_bytes") or c.get("used") or 0)
-                if t > 0:
-                    totals.append(t)
-                    useds.append(u)
-            if totals:
-                if spmd:
-                    per_total = min(totals)
-                    per_used = max(useds)
-                    return max(0, per_total - per_used), per_total
-                else:
-                    total = sum(totals)
-                    used = sum(useds)
-                    return max(0, total - used), total
-    except Exception:
-        pass
-
-    # Fallback: parse human output.
-    try:
-        proc = subprocess.run(
-            ["tpu-info"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-        if proc.returncode != 0:
-            return None
-        txt = proc.stdout
-        # Find lines like "0.00 GiB / 31.75 GiB"; collect per-chip totals/used.
-        gib_line = re.findall(r"([0-9]+\.[0-9]+)\s*GiB\s*/\s*([0-9]+\.[0-9]+)\s*GiB", txt)
-        totals = []
-        useds = []
-        for used_gib, total_gib in gib_line:
-            t = int(float(total_gib) * (1 << 30))
-            u = int(float(used_gib) * (1 << 30))
-            if t > 0:
-                totals.append(t)
-                useds.append(u)
-        if totals:
-            if spmd:
-                per_total = min(totals)
-                per_used = max(useds)
-                return max(0, per_total - per_used), per_total
-            else:
-                total = sum(totals)
-                used = sum(useds)
-                return max(0, total - used), total
-    except Exception:
-        return None
+    # Kept for API compatibility; delegate to per_replica_free_total when spmd.
+    if spmd:
+        return per_replica_free_total()
     return None
 
 
 def _tpu_info_query_subprocess() -> Optional[Tuple[int, int]]:
-    """Query per-replica (free, total) via tpu_info in a separate process.
-
-    Returns None if the helper fails or tpu_info is not present/works.
-    """
-    import subprocess, textwrap, json as _json
-
-    code = textwrap.dedent(
-        r'''
-import json
-try:
-  from tpu_info import device as tpu_device
-  from tpu_info import metrics as tpu_metrics
-  chip_type, count = tpu_device.get_local_chips()
-  if not chip_type or not count:
-    raise SystemExit(2)
-  device_usage = tpu_metrics.get_chip_usage(chip_type)
-  per_chip = [(int(d.total_memory), int(d.memory_usage)) for d in device_usage]
-  if not per_chip:
-    raise SystemExit(3)
-  free = min(t - u for (t, u) in per_chip)
-  total = min(t for (t, _u) in per_chip)
-  print(json.dumps({'free': free, 'total': total}))
-  raise SystemExit(0)
-except Exception:
-  raise SystemExit(1)
-''')
-    try:
-        proc = subprocess.run(
-            ["python", "-c", code],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        obj = _json.loads(proc.stdout.strip())
-        free = int(obj.get("free", 0))
-        total = int(obj.get("total", 0))
-        if total > 0:
-            return free, total
-    except Exception:
-        return None
-    return None
+    # Legacy alias; use per_replica_free_total.
+    return per_replica_free_total()
 
 
 def _estimate_upper_batch_from_tpu_memory(
@@ -1111,6 +978,11 @@ def main() -> None:
             raise ValueError("--bucket-boundaries must be a comma-separated list of ints, e.g. '512' or '512,1024'")
 
     print("\n2. Preprocessing and bucketing dataset...")
+    if args.log_tpu_memory:
+        try:
+            log_tpu_memory("preprocess/start")
+        except Exception as exc:
+            logger.warning("[mem] preprocess start log failed: %s", exc)
     train_bucket_samples, train_stats = _prepare_bucketed_samples(
         split=args.train_split,
         processor=processor,
@@ -1123,6 +995,11 @@ def main() -> None:
         seed=RNG_SEED + 1,
         max_length=max(BUCKET_BOUNDARIES),
     )
+    if args.log_tpu_memory:
+        try:
+            log_tpu_memory("preprocess/end")
+        except Exception as exc:
+            logger.warning("[mem] preprocess end log failed: %s", exc)
 
     print(
         "Train bucket counts:",
@@ -1425,11 +1302,32 @@ def main() -> None:
     print(f"\n6. Starting training for {len(train_ds)} steps...")
     state = None
     aux = None
+    mem_timer = None
+    if getattr(args, "mem_interval", 0.0) and args.mem_interval > 0:
+        try:
+            mem_timer = XLAMemoryTimer(interval=float(args.mem_interval))
+            mem_timer.start()
+            logger.info("[mem] background timer started (interval=%.2fs)", args.mem_interval)
+        except Exception as exc:
+            logger.warning("[mem] timer start failed: %s", exc)
     try:
         state, aux = trainer.train()
         print("\n✓ Training finished.")
     except StopIteration:
         print("\nTraining iterator exhausted (StopIteration); treating as finished.")
+    finally:
+        if mem_timer is not None:
+            try:
+                stats = mem_timer.stop(format_mb=True)
+                logger.info(
+                    "[mem] peak usage: total_used=%.2f GiB, peak_per_device=%.2f GiB, total=%.2f GiB, per_device_total=%.2f GiB",
+                    stats.get("max_mem", 0.0),
+                    stats.get("max_mem_per_device", 0.0),
+                    stats.get("mem_total", 0.0),
+                    stats.get("mem_per_device", 0.0),
+                )
+            except Exception as exc:
+                logger.warning("[mem] timer stop failed: %s", exc)
 
     # Post-training detailed memory log
     if state is not None:
@@ -1467,6 +1365,11 @@ def main() -> None:
             jsonl_path=metrics_jsonl_path,
             wandb_handle=wandb_handle,
         )
+        if args.log_tpu_memory:
+            try:
+                log_tpu_memory("post_training_eval")
+            except Exception as exc:
+                logger.warning("[mem] post_training_eval log failed: %s", exc)
         _log_tpu_memory_event(
             enabled=(not args.no_live_memory_query and (args.log_tpu_memory or args.log_batch_tuning)),
             label="post_training_eval/post",
@@ -1485,6 +1388,11 @@ def main() -> None:
             wandb_handle=wandb_handle,
             run_dir=run_dir,
         )
+        if args.log_tpu_memory:
+            try:
+                log_tpu_memory("chat_sample/post_training")
+            except Exception as exc:
+                logger.warning("[mem] chat_sample log failed: %s", exc)
 
     elapsed_seconds = time.time() - start_time
     print(

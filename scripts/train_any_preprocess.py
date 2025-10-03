@@ -62,8 +62,10 @@ from jax import errors as jax_errors
 from PIL import Image
 from grain import python as grain
 from transformers import (
+    AutoModelForCausalLM,
     AutoTokenizer,
     AutoProcessor,
+    Qwen2_5_VLForConditionalGeneration,
 )
 from huggingface_hub import snapshot_download
 import torch
@@ -247,30 +249,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=PROCESSOR_ID_ENV,
         help=("Hugging Face processor/tokenizer id to load (defaults to --model-id)."),
-    )
-    parser.add_argument(
-        "--hf-max-length",
-        type=int,
-        default=4096,
-        help="Max tokens for HF preprocessing (Qwen path).",
-    )
-    parser.add_argument(
-        "--hf-batch-size",
-        type=int,
-        default=1,
-        help="Global batch size for HF training (Qwen path).",
-    )
-    parser.add_argument(
-        "--hf-epochs",
-        type=int,
-        default=1,
-        help="Epochs for HF training (Qwen path).",
-    )
-    parser.add_argument(
-        "--hf-lr",
-        type=float,
-        default=1e-5,
-        help="Learning rate for HF training (Qwen path).",
     )
     parser.add_argument(
         "--log-tpu-memory",
@@ -1577,6 +1555,11 @@ def main() -> None:
     )
 
     logger.info(f"3. Defining {args.model_id} model (baseline HF placeholder)...")
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        args.model_id,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16 if args.jax_platform == "tpu" else torch.float16,
+    )
     # default: Load the model on the available device(s)
     logger.info(
         "[Gemma] Loading placeholder HF model id=%s device_map=auto torch_dtype=auto",

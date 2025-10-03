@@ -15,9 +15,11 @@ time python scripts/train_any_preprocess.py \
   --processor-id "$HF_PROCESSOR_ID" \
   --jax-platform tpu \
   --log-tpu-memory \
+  --fixed-max-length 4096 \
+  --fixed-batch-size 8 \
   --sample-image-url "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg" \
   --sample-prompt "Describe this image." \
-  --hf-batch-size 1 \
-  --hf-epochs 1 \
   --train-split "train[:3000]" \
-  --eval-split "test[:300]"
+  --train-epochs 5 \
+  --eval-split "test[:300]" \
+  --eval-epochs 5
