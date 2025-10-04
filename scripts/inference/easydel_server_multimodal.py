@@ -108,13 +108,28 @@ def main():
     param_dtype = dtype_map[args.param_dtype]
 
     # Set up max_length based on prefill and max_new_tokens
-    max_length = args.prefill_length + args.max_new_tokens
+    max_length = 4096 * 32
     partition_axis = ed.PartitionAxis()
 
     # Load processor for the multimodal model
     print(f"Loading processor for model: {args.model}")
     processor = AutoProcessor.from_pretrained(args.model)
     processor.padding_side = "left"
+
+    # --- ADD THIS FIX HERE ---
+    def __call__(self, *args, **kwargs):
+        # Call the original method
+        inputs = self.original_call(*args, **kwargs)
+        # Remove 'token_type_ids' to ensure consistent input structure for JAX
+        if "token_type_ids" in inputs:
+            del inputs["token_type_ids"]
+        return inputs
+
+    # Temporarily store the original call method
+    print("Applying fix to processor to remove token_type_ids...")
+    processor.original_call = processor.__call__
+    # Replace the processor's call method with the fixed one
+    processor.__call__ = __call__
 
     # Load the model
     print(f"Loading model: {args.model}")
