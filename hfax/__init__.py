@@ -56,6 +56,8 @@ _API_MODULES: Dict[str, str] = {
     'multimodal': 'hfax.multimodal',
     'peft': 'hfax.peft',
     'research': 'hfax.research',
+    'metrics': 'hfax.metrics',
+    'profiler': 'hfax.profiler',
 }
 
 

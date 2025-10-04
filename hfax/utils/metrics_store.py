@@ -159,51 +159,51 @@ def generate_html(records: list[dict[str, Any]], output_path: Path) -> None:
 <h1>Benchmark Results</h1>
 {tables}
 <script>
-function sortTable(table, col, isNumeric) {
+function sortTable(table, col, isNumeric) {{  
   let rows, switching, i, x, y, shouldSwitch, dir, switchcount = 0;
   switching = true;
   dir = "asc";
-  while (switching) {
+  while (switching) {{
     switching = false;
     rows = table.rows;
-    for (i = 1; i < (rows.length - 1); i++) {
+    for (i = 1; i < (rows.length - 1); i++) {{
       shouldSwitch = false;
       x = rows[i].getElementsByTagName("TD")[col];
       y = rows[i + 1].getElementsByTagName("TD")[col];
       let xContent = isNumeric ? parseFloat(x.innerHTML) || 0 : x.innerHTML.toLowerCase();
       let yContent = isNumeric ? parseFloat(y.innerHTML) || 0 : y.innerHTML.toLowerCase();
-      if (dir == "asc") {
-        if (xContent > yContent) {
+      if (dir == "asc") {{
+        if (xContent > yContent) {{
           shouldSwitch = true;
           break;
-        }
-      } else if (dir == "desc") {
-        if (xContent < yContent) {
+        }}
+      }} else if (dir == "desc") {{
+        if (xContent < yContent) {{
           shouldSwitch = true;
           break;
-        }
-      }
-    }
-    if (shouldSwitch) {
+        }}
+      }}
+    }}
+    if (shouldSwitch) {{
       rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
       switching = true;
       switchcount++;
-    } else {
-      if (switchcount == 0 && dir == "asc") {
+    }} else {{
+      if (switchcount == 0 && dir == "asc") {{
         dir = "desc";
         switching = true;
-      }
-    }
-  }
-}
+      }}
+    }}
+  }}
+}}
 
-document.querySelectorAll('th').forEach((th, colIndex) => {
-    th.addEventListener('click', () => {
+document.querySelectorAll('th').forEach((th, colIndex) => {{
+    th.addEventListener('click', () => {{
         const table = th.closest('table');
         const isNumeric = !isNaN(parseFloat(table.rows[1].cells[colIndex].innerHTML));
         sortTable(table, colIndex, isNumeric);
-    });
-});
+    }});
+}});
 </script>
 </body>
 </html>

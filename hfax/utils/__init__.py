@@ -28,5 +28,12 @@ if _GM_UTILS_DIR.exists():
         # __path__ is defined for packages; guard for static analyzers.
         pass
 
-__all__ = ()
+from . import logging, metrics_store, metric_utils
+
+__all__ = (
+    "logging",
+    "metrics_store",
+    "metric_utils",
+)
+
 
