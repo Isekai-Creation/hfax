@@ -1,0 +1,65 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>Benchmark Results</title>
+<style>
+  body { font-family: sans-serif; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 8px; }
+  th { background-color: #f2f2f2; cursor: pointer; }
+  tr:nth-child(even) { background-color: #f9f9f9; }
+</style>
+</head>
+<body>
+<h1>Benchmark Results</h1>
+<h2>Inference Runs</h2><table><thead><tr><th>Date (UTC)</th><th>Script</th><th>Phase</th><th>Mode</th><th>TPU</th><th>Token Count</th><th>Batch Size</th><th>Runs</th><th>Avg Total s</th><th>Avg First Token s</th><th>Avg Post-First s</th><th>Avg Tokens/s</th><th>Avg Decode Tokens/s</th><th>Avg Pre-First Tokens/s</th><th>Notes</th></tr></thead><tbody><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>With Image</td><td>v6e</td><td>128</td><td>1</td><td>1</td><td>67.8052</td><td>56.0170</td><td>11.7882</td><td>1.8878</td><td>10.7735</td><td>0.0179</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>Text-Only</td><td>v6e</td><td>128</td><td>1</td><td>1</td><td>33.1004</td><td>21.1222</td><td>11.9782</td><td>3.8670</td><td>10.6026</td><td>0.0473</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>With Image</td><td>v6e</td><td>256</td><td>1</td><td>1</td><td>70.3795</td><td>55.9641</td><td>14.4153</td><td>3.6374</td><td>17.6895</td><td>0.0179</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>Text-Only</td><td>v6e</td><td>256</td><td>1</td><td>1</td><td>34.5281</td><td>20.8636</td><td>13.6645</td><td>7.4142</td><td>18.6615</td><td>0.0479</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>With Image</td><td>v6e</td><td>128</td><td>1</td><td>10</td><td>2.0259</td><td>0.2513</td><td>1.7746</td><td>63.2512</td><td>71.6600</td><td>3.9796</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>Text-Only</td><td>v6e</td><td>128</td><td>1</td><td>10</td><td>2.0210</td><td>0.1927</td><td>1.8282</td><td>63.3400</td><td>69.4694</td><td>5.1913</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>With Image</td><td>v6e</td><td>256</td><td>1</td><td>10</td><td>3.9644</td><td>0.2676</td><td>3.6968</td><td>64.6055</td><td>69.0163</td><td>3.7372</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>Text-Only</td><td>v6e</td><td>256</td><td>1</td><td>10</td><td>3.9137</td><td>0.1979</td><td>3.7158</td><td>65.4166</td><td>68.6315</td><td>5.0548</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:26:45</td><td>run_gemma_inference_jax.py</td><td>final</td><td>Final Output</td><td>v6e</td><td>128</td><td>1</td><td>1</td><td>71.2260</td><td>59.3130</td><td>11.9130</td><td>1.7971</td><td>10.6606</td><td>0.0169</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:35:11</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>With Image</td><td>v6e</td><td>512</td><td>1</td><td>1</td><td>70.2293</td><td>55.5338</td><td>14.6955</td><td>4.9979</td><td>23.8168</td><td>0.0180</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:35:11</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>Text-Only</td><td>v6e</td><td>512</td><td>1</td><td>1</td><td>37.1834</td><td>20.1356</td><td>17.0478</td><td>13.7696</td><td>29.9745</td><td>0.0497</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:35:11</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>With Image</td><td>v6e</td><td>512</td><td>1</td><td>10</td><td>5.2053</td><td>0.2578</td><td>4.9475</td><td>67.4416</td><td>70.7548</td><td>3.8792</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:35:11</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>Text-Only</td><td>v6e</td><td>512</td><td>1</td><td>10</td><td>7.2531</td><td>0.1849</td><td>7.0682</td><td>70.5944</td><td>72.2998</td><td>5.4109</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:35:11</td><td>run_gemma_inference_jax.py</td><td>final</td><td>Final Output</td><td>v6e</td><td>128</td><td>1</td><td>1</td><td>76.9055</td><td>64.6255</td><td>12.2800</td><td>1.6644</td><td>10.3420</td><td>0.0155</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:45:56</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>With Image</td><td>v6e</td><td>1024</td><td>1</td><td>1</td><td>70.3651</td><td>55.3114</td><td>15.0537</td><td>4.9883</td><td>23.2501</td><td>0.0181</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:45:56</td><td>run_gemma_inference_jax.py</td><td>warmup</td><td>Text-Only</td><td>v6e</td><td>1024</td><td>1</td><td>1</td><td>46.9640</td><td>21.5344</td><td>25.4296</td><td>21.8039</td><td>40.2287</td><td>0.0464</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:45:56</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>With Image</td><td>v6e</td><td>1024</td><td>1</td><td>10</td><td>5.2705</td><td>0.2646</td><td>5.0059</td><td>66.6220</td><td>69.9445</td><td>3.7813</td><td>image_used=True</td></tr><tr><td>2025-10-04 16:45:56</td><td>run_gemma_inference_jax.py</td><td>benchmark</td><td>Text-Only</td><td>v6e</td><td>1024</td><td>1</td><td>10</td><td>14.7445</td><td>0.1948</td><td>14.5497</td><td>69.4644</td><td>70.3256</td><td>5.1431</td><td>image_used=False</td></tr><tr><td>2025-10-04 16:45:56</td><td>run_gemma_inference_jax.py</td><td>final</td><td>Final Output</td><td>v6e</td><td>128</td><td>1</td><td>1</td><td>77.6212</td><td>65.1420</td><td>12.4792</td><td>1.6490</td><td>10.1770</td><td>0.0154</td><td>image_used=True</td></tr></tbody></table>
+<script>
+function sortTable(table, col, isNumeric) {  
+  let rows, switching, i, x, y, shouldSwitch, dir, switchcount = 0;
+  switching = true;
+  dir = "asc";
+  while (switching) {
+    switching = false;
+    rows = table.rows;
+    for (i = 1; i < (rows.length - 1); i++) {
+      shouldSwitch = false;
+      x = rows[i].getElementsByTagName("TD")[col];
+      y = rows[i + 1].getElementsByTagName("TD")[col];
+      let xContent = isNumeric ? parseFloat(x.innerHTML) || 0 : x.innerHTML.toLowerCase();
+      let yContent = isNumeric ? parseFloat(y.innerHTML) || 0 : y.innerHTML.toLowerCase();
+      if (dir == "asc") {
+        if (xContent > yContent) {
+          shouldSwitch = true;
+          break;
+        }
+      } else if (dir == "desc") {
+        if (xContent < yContent) {
+          shouldSwitch = true;
+          break;
+        }
+      }
+    }
+    if (shouldSwitch) {
+      rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
+      switching = true;
+      switchcount++;
+    } else {
+      if (switchcount == 0 && dir == "asc") {
+        dir = "desc";
+        switching = true;
+      }
+    }
+  }
+}
+
+document.querySelectorAll('th').forEach((th, colIndex) => {
+    th.addEventListener('click', () => {
+        const table = th.closest('table');
+        const isNumeric = !isNaN(parseFloat(table.rows[1].cells[colIndex].innerHTML));
+        sortTable(table, colIndex, isNumeric);
+    });
+});
+</script>
+</body>
+</html>

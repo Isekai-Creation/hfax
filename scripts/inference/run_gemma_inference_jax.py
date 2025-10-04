@@ -7,13 +7,23 @@ from __future__ import annotations
 import argparse
 import io
 import math
+from pathlib import Path
 import re
 import statistics
 import time
-from hfax.gm.text import _template
+from typing import Any, Iterable
+
+import numpy as np
+import requests
+import jax
+import jax.numpy as jnp
+import hfax
+from hfax import peft  # Parameter fine-tuning module
 from hfax.utils import metrics_store
 from hfax.utils.logging import logger
 from hfax.metrics import RunMetrics
+from PIL import Image
+
 
 def _safe_stats(values: Iterable[float]) -> tuple[float, float]:
     values = [v for v in values if math.isfinite(v)]
@@ -165,8 +175,6 @@ def _summarize_metrics(metrics_list: list[RunMetrics]) -> dict[str, float] | Non
     }
 
 
-
-
 def setup_model(args: argparse.Namespace) -> tuple:
     """Sets up the model, parameters, and tokenizer."""
     logger.info("Loading model, tokenizer, and parameters...")
@@ -174,16 +182,18 @@ def setup_model(args: argparse.Namespace) -> tuple:
     # 1. Build model (normal or quantized)
     if args.quant_method == "NONE":
         logger.info("Using normal (non-quantized) model.")
-        model = gm.nn.Gemma3_4B()
+        model = hfax.gm.nn.Gemma3_4B()
     else:
         logger.info(f"Using {args.quant_method} quantized model.")
         q_dtype = jnp.int8 if args.quant_method == "INT8" else jnp.int4
-        model = gm.nn.IntWrapper(model=gm.nn.Gemma3_4B(text_only=True), dtype=q_dtype)
+        model = hfax.gm.nn.IntWrapper(
+            model=hfax.gm.nn.Gemma3_4B(text_only=True), dtype=q_dtype
+        )
 
     # 2. Load parameters
-    ckpt_path = gm.ckpts.CheckpointPath.GEMMA3_4B_IT
+    ckpt_path = hfax.gm.ckpts.CheckpointPath.GEMMA3_4B_IT
     logger.info(f"Loading parameters from: {ckpt_path}")
-    params = gm.ckpts.load_params(path=ckpt_path)
+    params = hfax.gm.ckpts.load_params(path=ckpt_path)
 
     # 3. Quantize if needed
     if args.quant_method != "NONE":
@@ -196,13 +206,13 @@ def setup_model(args: argparse.Namespace) -> tuple:
         logger.info("Quantization complete.")
 
     # 4. Tokenizer
-    tokenizer = gm.text.Gemma3Tokenizer()
+    tokenizer = hfax.gm.text.Gemma3Tokenizer()
 
     return model, params, tokenizer
 
 
 def run_inference_with_metrics(
-    sampler: gm.text.ChatSampler,
+    sampler: hfax.gm.text.ChatSampler,
     prompt: str,
     max_new_tokens: int,
     image: np.ndarray | None = None,
@@ -213,11 +223,9 @@ def run_inference_with_metrics(
     object.__setattr__(sampler, "last_state", None)
     object.__setattr__(sampler, "turns", [])
 
-    formatted_prompt = _template.PROMPT.format(prompt)
-
     start_time = time.perf_counter()
     stream_iter = sampler.sampler.sample(
-        formatted_prompt,
+        prompt,
         images=image,
         max_new_tokens=max_new_tokens,
         stream=True,
@@ -280,7 +288,7 @@ def main(args: argparse.Namespace):
     model, params, tokenizer = setup_model(args)
 
     logger.info("Instantiating ChatSampler...")
-    sampler = gm.text.ChatSampler(
+    sampler = hfax.gm.text.ChatSampler(
         model=model,
         params=params,
         tokenizer=tokenizer,
