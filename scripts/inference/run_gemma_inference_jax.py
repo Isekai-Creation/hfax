@@ -22,8 +22,9 @@ import numpy as np
 import requests
 from PIL import Image
 
-from hfax.utils.logging import logger
 from hfax.gm.text import _template
+from hfax.utils import metrics_store
+from hfax.utils.logging import logger
 
 # Import logging and profiling utilities
 
@@ -237,65 +238,6 @@ def _summarize_metrics(metrics_list: list[RunMetrics]) -> dict[str, float] | Non
     }
 
 
-def _format_float(value: float, *, empty: str = "") -> str:
-    if value is None:
-        return empty
-    if not math.isfinite(value):
-        return "nan"
-    return f"{value:.4f}"
-
-
-def _write_benchmark_report(
-    entries: list[dict[str, Any]],
-    *,
-    run_type: str,
-    tpu_type: str,
-    batch_size: int,
-    script_name: str,
-):
-    if not entries:
-        return
-
-    repo_root = Path(__file__).resolve().parents[2]
-    benchmarks_dir = repo_root / "benchmarks"
-    benchmarks_dir.mkdir(parents=True, exist_ok=True)
-    readme_path = benchmarks_dir / "README.md"
-
-    header = (
-        "# Benchmark Results\n\n"
-        "Each row captures a completed warmup, benchmark, or final inference/training run."
-        " All timestamps are UTC.\n\n"
-        "| Date (UTC) | Script | Run Type | Phase | Mode | TPU | Token Count | Batch Size | Runs | Avg Total s | Avg First Token s | Avg Tokens/s | Avg Decode Tokens/s | Avg Pre-First Tokens/s | Notes |\n"
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
-    )
-
-    if not readme_path.exists():
-        readme_path.write_text(header, encoding="utf-8")
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    with readme_path.open("a", encoding="utf-8") as fd:
-        for entry in entries:
-            summary = entry["metrics_summary"]
-            row = (
-                f"| {timestamp}"
-                f" | {script_name}"
-                f" | {run_type}"
-                f" | {entry['phase']}"
-                f" | {entry['label']}"
-                f" | {tpu_type}"
-                f" | {entry['token_count']}"
-                f" | {batch_size}"
-                f" | {entry['runs']}"
-                f" | {_format_float(summary['avg_total'])}"
-                f" | {_format_float(summary['avg_first'])}"
-                f" | {_format_float(summary['avg_tps']) if run_type == 'inference' else ''}"
-                f" | {_format_float(summary['avg_decode_tps']) if run_type == 'inference' else ''}"
-                f" | {_format_float(summary['avg_prefirst_tps']) if run_type == 'inference' else ''}"
-                f" | {entry['notes']}"
-                f" |\n"
-            )
-            fd.write(row)
 
 
 def setup_model(args: argparse.Namespace) -> tuple:
@@ -646,13 +588,17 @@ def main(args: argparse.Namespace):
             }
         )
 
-    _write_benchmark_report(
-        report_entries,
-        run_type=args.run_type,
-        tpu_type=args.tpu_type,
-        batch_size=args.batch_size,
-        script_name=Path(__file__).name,
-    )
+    run_metadata = {
+        "script": Path(__file__).name,
+        "run_type": args.run_type,
+        "tpu_type": args.tpu_type,
+        "quant_method": args.quant_method,
+        "batch_size": args.batch_size,
+        "benchmark_runs": args.benchmark_runs,
+        "warmup_runs": args.warmup_runs,
+    }
+
+    metrics_store.save_records(report_entries, run_meta=run_metadata)
 
 
 if __name__ == "__main__":
@@ -691,7 +637,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--benchmark-runs",
         type=int,
-        default=1,
+        default=3,
         help="Number of benchmark runs.",
     )
     parser.add_argument(
@@ -724,6 +670,19 @@ if __name__ == "__main__":
         "--final-text-only",
         action="store_true",
         help="Generate the final output without providing an image.",
+    )
+    parser.add_argument(
+        "--run-type",
+        type=str,
+        choices=["inference", "training"],
+        default="inference",
+        help="Record results under this workload type.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Effective batch size for this run (stored in benchmark reports).",
     )
     cli_args = parser.parse_args()
     main(cli_args)
